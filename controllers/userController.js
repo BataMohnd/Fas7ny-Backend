@@ -197,16 +197,100 @@ exports.removeSavedPlace = async (req, res) => {
     }
 };
 
-// GET /api/users/:userId/saved  — fetch the full saved list
+// GET /api/users/:userId/saved — fetch the full saved list
 exports.getSavedPlaces = async (req, res) => {
-    try {
-        const { userId } = req.params;
-        const user = await User.findOne({ uid: userId }).select('savedPlaces');
+  try {
+    const { userId } = req.params;
+    const user = await User.findOne({ $or: [{ _id: userId }, { uid: userId }] });
+    if (!user) return res.status(404).json({ message: 'User not found' });
 
-        if (!user) return res.status(404).json({ status: 'fail', message: 'User not found' });
+    const savedIds = user.savedPlaces || [];
+    console.log(`[SavedPlaces] User ${userId} has ${savedIds.length} saved IDs:`, savedIds);
 
-        res.status(200).json({ status: 'success', savedPlaces: user.savedPlaces || [] });
-    } catch (err) {
-        res.status(400).json({ status: 'fail', message: err.message });
+    if (savedIds.length === 0) {
+      return res.status(200).json({ success: true, savedPlaces: [] });
     }
+
+    // Load ALL cache docs once
+    const NearbyPlaceCache = require('../models/NearbyPlaceCache');
+    const allCaches = await NearbyPlaceCache.find({}).lean();
+    console.log(`[SavedPlaces] Total cache docs: ${allCaches.length}`);
+
+    // Build a flat lookup map: id → place data
+    const placeMap = {};
+    for (const cache of allCaches) {
+      for (const item of (cache.items || [])) {
+        const id = item.id || item.placeId || item._id?.toString();
+        if (id) placeMap[id] = { ...item, city: cache.city };
+      }
+    }
+    console.log(`[SavedPlaces] Total cached places available: ${Object.keys(placeMap).length}`);
+
+    // City image fallbacks per city name
+    const cityImages = {
+      'Cairo':          'https://images.unsplash.com/photo-1503177119275-0aa32b3a9368?w=600',
+      'Hurghada':       'https://images.unsplash.com/photo-1507525428034-b723cf961d3e?w=600',
+      'Luxor':          'https://images.unsplash.com/photo-1539209581898-842e47c177af?w=600',
+      'Aswan':          'https://images.unsplash.com/photo-1568322445389-f64ac2515020?w=600',
+      'Sharm El-Sheikh':'https://images.unsplash.com/photo-1544551763-46a013bb70d5?w=600',
+      'Alexandria':     'https://images.unsplash.com/photo-1571896349842-33c89424de2d?w=600',
+      'Dahab':          'https://images.unsplash.com/photo-1544256241-11dcedfeb8f8?w=600',
+    };
+
+    // Category image fallbacks
+    const categoryImages = {
+      'restaurant': 'https://images.unsplash.com/photo-1517248135467-4c7edcad34c4?w=600',
+      'cafe':       'https://images.unsplash.com/photo-1554118811-1e0d58224f24?w=600',
+      'activity':   'https://images.unsplash.com/photo-1503177119275-0aa32b3a9368?w=600',
+      'hotel':      'https://images.unsplash.com/photo-1520250497591-112f2f40a3f4?w=600',
+    };
+
+    const enriched = savedIds.map(id => {
+      const cached = placeMap[id];
+
+      if (cached) {
+        const city = cached.city || '';
+        const type = cached.type || cached.category || 'activity';
+        const imageUrl = cached.imageUrl ||
+          cityImages[city] ||
+          categoryImages[type] ||
+          'https://images.unsplash.com/photo-1503177119275-0aa32b3a9368?w=600';
+
+        return {
+          id,
+          name: cached.name || 'Saved Place',
+          imageUrl,
+          neighbourhood: cached.address || city || 'Egypt',
+          city,
+          price: cached.price || 0,
+          rating: cached.rating || 4.0,
+          latitude: cached.lat || cached.latitude,
+          longitude: cached.lng || cached.longitude,
+          category: type,
+          source: 'google_places',
+        };
+      }
+
+      // Not found in cache — return with unique placeholder based on ID hash
+      const cityKeys = Object.keys(cityImages);
+      const fallbackCity = cityKeys[id.charCodeAt(0) % cityKeys.length];
+      return {
+        id,
+        name: 'Saved Place',
+        imageUrl: cityImages[fallbackCity],
+        neighbourhood: 'Tap to explore',
+        city: fallbackCity,
+        price: 0,
+        rating: 4.0,
+        source: 'saved',
+      };
+    });
+
+    console.log(`[SavedPlaces] Enriched ${enriched.filter(e => e.name !== 'Saved Place').length}/${enriched.length} places`);
+    return res.status(200).json({ success: true, savedPlaces: enriched });
+
+  } catch (err) {
+    console.error('[SavedPlaces] Error:', err.message);
+    res.status(500).json({ message: err.message });
+  }
 };

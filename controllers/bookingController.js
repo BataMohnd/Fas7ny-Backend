@@ -23,7 +23,9 @@ exports.createBooking = async (req, res) => {
             currency, 
             status, 
             placeType,
-            paymentMethod 
+            paymentMethod,
+            source,
+            interestTags
         } = req.body;
 
         // 1. Validation
@@ -66,7 +68,9 @@ exports.createBooking = async (req, res) => {
             currency: currency || 'EGP',
             status: status || 'active',
             placeType: placeType || 'hotel',
-            paymentMethod: paymentMethod || 'VISA'
+            paymentMethod: paymentMethod || 'VISA',
+            source: source || 'manual',
+            interestTags: interestTags || []
         };
 
         const newBooking = new Booking(bookingData);
@@ -129,8 +133,6 @@ async function _handlePostBookingActions(booking) {
         } catch (e) { console.warn("Price history log failed"); }
     }
 }
-
-// ... rest of the methods remain similar but with placeId support
 
 exports.getUserBookings = async (req, res) => {
     try {

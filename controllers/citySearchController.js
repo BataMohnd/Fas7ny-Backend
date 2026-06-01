@@ -1,16 +1,45 @@
 const axios = require('axios');
 const NodeCache = require('node-cache');
 const NearbyPlaceCache = require('../models/NearbyPlaceCache');
-const { callGemini } = require('../utils/geminiClient');
 const placeController = require('./placeController');
+const UserPlace = require('../models/UserPlace');
 
 // In-memory cache: city search results valid for 30 minutes
 if (!global.citySearchCache) global.citySearchCache = new NodeCache({ stdTTL: 1800 });
 const citySearchCache = global.citySearchCache;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// City coordinate map (used to resolve city name → lat/lng for Google Places)
-// ─────────────────────────────────────────────────────────────────────────────
+/**
+ * Pure Algorithm-based Value Score Ranking
+ */
+function calcValueScore(place, userPreferences = [], userBudgetPerDay = 0) {
+  const rating = place.rating || 4.0;
+  const price = place.price || place.estimatedCost || 100;
+  const maxPrice = 5000;
+
+  // Base score: 60% rating + 40% price efficiency
+  const ratingScore = (rating / 5.0) * 60;
+  const priceScore = (1 - Math.min(price / maxPrice, 1)) * 40;
+  let score = ratingScore + priceScore;
+
+  // Bonus: +15 if matches user preferences
+  if (userPreferences.length > 0) {
+    const placeText = `${place.name} ${place.category || ''} ${place.type || ''} ${place.address || ''}`.toLowerCase();
+    const prefMatch = userPreferences.some(pref =>
+      placeText.includes(pref.toLowerCase())
+    );
+    if (prefMatch) score += 15;
+  }
+
+  // Bonus: +10 if within budget
+  if (userBudgetPerDay > 0 && price <= userBudgetPerDay) score += 10;
+
+  // Bonus: +5 if highly rated (4.5+)
+  if (rating >= 4.5) score += 5;
+
+  return Math.round(score * 10) / 10;
+}
+
+// City coordinate map
 const CITY_COORDS = {
     'cairo':          { lat: 30.0444, lng: 31.2357 },
     'alexandria':     { lat: 31.2001, lng: 29.9187 },
@@ -26,19 +55,143 @@ const CITY_COORDS = {
 
 const resolveCityCoords = (cityName) => {
     const key = cityName.toLowerCase().trim();
-    return CITY_COORDS[key] || CITY_COORDS['cairo']; // fallback to Cairo
+    return CITY_COORDS[key] || CITY_COORDS['cairo'];
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// HELPER: Fetch one category from Google Places Text Search API
-// Uses the city name as a text query (no lat/lng restriction needed)
-// ─────────────────────────────────────────────────────────────────────────────
+// Google Places API v1 — getPlace with all fields
+const getPlaceDetails = async (placeId) => {
+  try {
+    const response = await axios.get(
+      `https://places.googleapis.com/v1/places/${placeId}`,
+      {
+        headers: {
+          'X-Goog-Api-Key': process.env.GOOGLE_MAPS_API_KEY,
+          'X-Goog-FieldMask': [
+            'id', 'displayName', 'formattedAddress',
+            'rating', 'userRatingCount',
+            'priceLevel',
+            'currentOpeningHours',
+            'photos',
+            'editorialSummary',
+            'regularOpeningHours',
+            'internationalPhoneNumber',
+            'websiteUri',
+            'location',
+            'types',
+          ].join(','),
+        },
+      }
+    );
+    return response.data;
+  } catch (err) {
+    return null;
+  }
+};
+
+// Convert Google priceLevel to EGP estimate
+function priceLevelToEGP(priceLevel, type) {
+  const priceMap = {
+    'restaurant': {
+      'PRICE_LEVEL_FREE':          0,
+      'PRICE_LEVEL_INEXPENSIVE':   80,
+      'PRICE_LEVEL_MODERATE':      200,
+      'PRICE_LEVEL_EXPENSIVE':     450,
+      'PRICE_LEVEL_VERY_EXPENSIVE':900,
+    },
+    'cafe': {
+      'PRICE_LEVEL_FREE':          0,
+      'PRICE_LEVEL_INEXPENSIVE':   50,
+      'PRICE_LEVEL_MODERATE':      120,
+      'PRICE_LEVEL_EXPENSIVE':     250,
+      'PRICE_LEVEL_VERY_EXPENSIVE':500,
+    },
+    'hotel': {
+      'PRICE_LEVEL_FREE':          0,
+      'PRICE_LEVEL_INEXPENSIVE':   500,
+      'PRICE_LEVEL_MODERATE':      1200,
+      'PRICE_LEVEL_EXPENSIVE':     2500,
+      'PRICE_LEVEL_VERY_EXPENSIVE':5000,
+    },
+    'activity': {
+      'PRICE_LEVEL_FREE':          0,
+      'PRICE_LEVEL_INEXPENSIVE':   50,
+      'PRICE_LEVEL_MODERATE':      150,
+      'PRICE_LEVEL_EXPENSIVE':     350,
+      'PRICE_LEVEL_VERY_EXPENSIVE':700,
+    },
+  };
+  const category = priceMap[type] || priceMap['activity'];
+  return category[priceLevel] ?? category['PRICE_LEVEL_MODERATE'];
+}
+
+// Build real photo URL from Google Places photo reference
+function buildPhotoUrl(photoName, maxWidth = 800) {
+  if (!photoName) return null;
+  return `https://places.googleapis.com/v1/${photoName}/media?maxWidthPx=${maxWidth}&key=${process.env.GOOGLE_MAPS_API_KEY}`;
+}
+
+// Normalize a Google Place to our format
+function normalizeGooglePlace(place, type, cityName) {
+  const priceLevel = place.priceLevel || 'PRICE_LEVEL_MODERATE';
+  const price      = priceLevelToEGP(priceLevel, type);
+
+  // Get first real photo
+  const photos    = place.photos || [];
+  const photoName = photos[0]?.name;
+  const imageUrl  = photoName
+    ? buildPhotoUrl(photoName, 800)
+    : _cityFallbackImage(cityName);
+
+  // Menu hint from opening hours and summary
+  const summary = place.editorialSummary?.text || null;
+  const hasMenu = ['restaurant', 'cafe', 'bakery', 'bar'].includes(type);
+  const menuNote = hasMenu
+    ? (price > 0
+        ? `Typical spend: ~${price} EGP per person`
+        : 'Menu pricing varies — contact the venue for current prices')
+    : null;
+
+  return {
+    id:          place.id,
+    name:        place.displayName?.text || 'Unknown',
+    address:     place.formattedAddress  || cityName,
+    rating:      place.rating            || 4.0,
+    reviewCount: place.userRatingCount   || 0,
+    price,
+    priceLevel,
+    currency:    'EGP',
+    imageUrl,
+    allPhotos:   photos.slice(0, 5).map(p => buildPhotoUrl(p.name, 600)),
+    type,
+    category:    type,
+    city:        cityName,
+    description: summary,
+    menuNote,
+    phone:       place.internationalPhoneNumber || null,
+    website:     place.websiteUri || null,
+    lat:         place.location?.latitude,
+    lng:         place.location?.longitude,
+    isOpenNow:   place.currentOpeningHours?.openNow ?? null,
+    source:      'google_places',
+  };
+}
+
+function _cityFallbackImage(city) {
+  const map = {
+    'Cairo':          'https://images.unsplash.com/photo-1503177119275-0aa32b3a9368?w=800',
+    'Luxor':          'https://images.unsplash.com/photo-1539209581898-842e47c177af?w=800',
+    'Hurghada':       'https://images.unsplash.com/photo-1507525428034-b723cf961d3e?w=800',
+    'Aswan':          'https://images.unsplash.com/photo-1568322445389-f64ac2515020?w=800',
+    'Sharm El-Sheikh':'https://images.unsplash.com/photo-1544551763-46a013bb70d5?w=800',
+    'Alexandria':     'https://images.unsplash.com/photo-1571896349842-33c89424de2d?w=800',
+    'Dahab':          'https://images.unsplash.com/photo-1544256241-11dcedfeb8f8?w=800',
+  };
+  return map[city] || map['Cairo'];
+}
+
 const fetchCategoryForCity = async (city, categoryLabel, googleTypes) => {
     const apiKey = process.env.GOOGLE_MAPS_API_KEY;
-    if (!apiKey || apiKey.length < 10) {
-        console.warn(`[City Search] Google API key missing — skipping live fetch for ${categoryLabel}`);
-        return [];
-    }
+    if (!apiKey || apiKey.length < 10) return [];
 
     try {
         const coords = resolveCityCoords(city);
@@ -46,11 +199,11 @@ const fetchCategoryForCity = async (city, categoryLabel, googleTypes) => {
             'https://places.googleapis.com/v1/places:searchNearby',
             {
                 includedTypes: googleTypes,
-                maxResultCount: 10,
+                maxResultCount: 15,
                 locationRestriction: {
                     circle: {
                         center: { latitude: coords.lat, longitude: coords.lng },
-                        radius: 50000  // 50km radius covers entire city regions
+                        radius: 50000
                     }
                 }
             },
@@ -58,78 +211,34 @@ const fetchCategoryForCity = async (city, categoryLabel, googleTypes) => {
                 headers: {
                     'Content-Type': 'application/json',
                     'X-Goog-Api-Key': apiKey,
-                    'X-Goog-FieldMask': 'places.id,places.displayName,places.formattedAddress,places.location,places.rating,places.userRatingCount,places.types,places.googleMapsUri'
+                    'X-Goog-FieldMask': 'places.id,places.displayName,places.formattedAddress,places.location,places.rating,places.userRatingCount,places.types,places.googleMapsUri,places.priceLevel,places.currentOpeningHours,places.photos,places.editorialSummary,places.regularOpeningHours,places.internationalPhoneNumber,places.websiteUri'
                 },
                 timeout: 8000
             }
         );
 
         const places = response.data.places || [];
-        console.log(`✅ [City Search] ${categoryLabel} in ${city}: ${places.length} results`);
-
-        return places.map(p => ({
-            id: p.id,
-            name: p.displayName?.text || 'Unknown Place',
-            address: p.formattedAddress || city,
-            city,
-            rating: p.rating || 4.0,
-            reviewCount: p.userRatingCount || 0,
-            category: categoryLabel,
-            price: _estimatePrice(categoryLabel),
-            imageUrl: _getImage(categoryLabel),
-            location: { latitude: p.location?.latitude, longitude: p.location?.longitude },
-            mapUri: p.googleMapsUri || null,
-            source: 'google_places'
-        }));
+        return places.map(p => normalizeGooglePlace(p, categoryLabel, city));
     } catch (err) {
-        console.warn(`[City Search] Google fetch failed for ${categoryLabel}: ${err.message}`);
         return [];
     }
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// HELPER: MongoDB cache lookup (city-based filter on NearbyPlaceCache items)
-// Used as Tier 2 when Google Places fails or is slow
-// ─────────────────────────────────────────────────────────────────────────────
 const fetchFromMongoCache = async (city) => {
     try {
-        // Sanitize input before using in regex (prevent ReDoS)
         const sanitized = city.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
         const cityRegex = new RegExp(sanitized, 'i');
-
-        // Try direct city match on cache documents
         const caches = await NearbyPlaceCache.find({ city: cityRegex }).lean();
-
         if (caches.length > 0) {
             const items = caches.flatMap(c => c.items || []);
-            console.log(`💾 [City Search] MongoDB cache hit for "${city}": ${items.length} items`);
             return items.map(item => ({ ...item, city, source: 'mongo_cache' }));
         }
-
-        // Also try scanning all cache items' address fields for the city name
-        const allCaches = await NearbyPlaceCache.find({}).lean();
-        const matched = [];
-        for (const cache of allCaches) {
-            const cityItems = (cache.items || []).filter(item =>
-                (item.address || '').match(cityRegex) ||
-                (item.name || '').match(cityRegex)
-            );
-            matched.push(...cityItems.map(item => ({ ...item, city, source: 'mongo_cache' })));
-        }
-
-        if (matched.length > 0) {
-            console.log(`💾 [City Search] MongoDB address scan found ${matched.length} items for "${city}"`);
-        }
-        return matched;
+        return [];
     } catch (err) {
-        console.warn(`[City Search] MongoDB cache lookup failed: ${err.message}`);
         return [];
     }
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// HELPER: Hardcoded fallback data per city
-// ─────────────────────────────────────────────────────────────────────────────
 const _hardcodedFallback = (city) => {
     const c = city.toLowerCase();
     const base = (items) => items.map((item, i) => ({ ...item, id: `hc_${i}`, city, source: 'hardcoded', price: item.price || 150 }));
@@ -152,7 +261,6 @@ const _hardcodedFallback = (city) => {
         { name: 'Steigenberger Nile Palace', category: 'hotel', rating: 4.7, address: 'Luxor', imageUrl: 'https://images.unsplash.com/photo-1542314831-068cd1dbfeeb?w=600', price: 3500 },
         { name: 'Sofra Restaurant & Cafe', category: 'restaurant', rating: 4.5, address: 'Mohamed Farid St, Luxor', imageUrl: 'https://images.unsplash.com/photo-1517248135467-4c7edcad34c4?w=600' },
     ]);
-    // Default: Cairo
     return base([
         { name: 'The Great Pyramids of Giza', category: 'activity', rating: 4.9, address: 'Giza, Cairo', imageUrl: 'https://images.unsplash.com/photo-1503177119275-0aa32b3a9368?w=600' },
         { name: 'Egyptian Museum', category: 'activity', rating: 4.7, address: 'Tahrir Square, Cairo', imageUrl: 'https://images.unsplash.com/photo-1518998053574-53ee81eb6449?w=600' },
@@ -161,243 +269,252 @@ const _hardcodedFallback = (city) => {
     ]);
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// MAIN: UnifiedCitySearch — queries all categories via Promise.all
-// GET /api/ai/city-search?city=Hurghada&budget=5000
-// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/ai/city-search
 exports.citySearch = async (req, res) => {
     const city = (req.query.city || req.body.city || 'Cairo').trim();
     const budget = parseFloat(req.query.budget || req.body.budget || 0);
 
-    console.log(`\n[City Search] ─── city: "${city}" | budget: ${budget} EGP ───`);
-
-    // In-memory cache key
     const cacheKey = `city_${city.toLowerCase()}_${Math.floor(budget / 1000)}k`;
     const cached = citySearchCache.get(cacheKey);
-    if (cached) {
-        console.log(`⚡ [City Search] Memory cache HIT for "${city}"`);
-        return res.status(200).json({ success: true, source: 'cache', city, ...cached });
-    }
+    if (cached) return res.status(200).json({ success: true, city, ...cached });
 
     try {
-        // ── Tier 1: Google Places API — Unified search via Promise.all ─────────
         let hotels = [];
         const mockRes = { status: () => ({ json: (d) => { if (d.success) hotels = d.data || []; } }) };
 
-        const [restaurants, activities, cafes, beaches, _] = await Promise.all([
+        const [restaurants, activities, cafes, beaches] = await Promise.all([
             fetchCategoryForCity(city, 'restaurant', ['restaurant', 'food']),
             fetchCategoryForCity(city, 'activity',   ['tourist_attraction', 'museum', 'amusement_park', 'park']),
             fetchCategoryForCity(city, 'cafe',        ['cafe', 'coffee_shop', 'bakery']),
             fetchCategoryForCity(city, 'beach',       ['beach', 'natural_feature']),
-            placeController.getHotelsByCity({ query: { city } }, mockRes) // Fetch hotels in parallel
+            placeController.getHotelsByCity({ query: { city } }, mockRes)
         ]);
 
         let allPlaces = [...restaurants, ...activities, ...cafes, ...beaches];
-        let dataSource = 'google_places';
+        if (allPlaces.length === 0) allPlaces = await fetchFromMongoCache(city);
+        if (allPlaces.length === 0) allPlaces = _hardcodedFallback(city);
 
-        // ── Tier 2: MongoDB cache if Google returned nothing ──────────────────
-        if (allPlaces.length === 0) {
-            console.warn(`[City Search] Google returned 0 results. Falling back to MongoDB cache.`);
-            allPlaces = await fetchFromMongoCache(city);
-            dataSource = 'mongo_cache';
-        }
+        // RANKING ALGORITHM
+        console.log(`[Algorithm] Scoring ${allPlaces.length} places for ${city}...`);
+        const score = (p) => calcValueScore(p, [], budget);
+        const addScore = (p) => ({
+            ...p,
+            valueScore: score(p),
+            scoreBadge: score(p) >= 80 ? '🥇' : score(p) >= 65 ? '🥈' : '🥉'
+        });
 
-        // ── Tier 3: Hardcoded fallback ────────────────────────────────────────
-        if (allPlaces.length === 0) {
-            console.warn(`[City Search] All sources empty. Using hardcoded fallback for "${city}".`);
-            allPlaces = _hardcodedFallback(city);
-            dataSource = 'hardcoded';
-        }
+        const rankedAll = allPlaces.map(addScore).sort((a,b) => b.valueScore - a.valueScore);
 
-        // ── Budget filter (Wallet-Aware): if budget provided, prioritize affordable items ──
-        let filteredPlaces = allPlaces;
-        if (budget > 0) {
-            const affordable = allPlaces.filter(p => !p.price || p.price <= budget);
-            filteredPlaces = affordable.length > 0 ? affordable : allPlaces;
-            console.log(`[City Search] Budget filter (≤ ${budget} EGP): ${filteredPlaces.length}/${allPlaces.length} places qualify`);
-        }
+        // ── Community places: fetch & merge after Google results ──────────────
+        const sanitizedCity = city.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const userPlaces = await UserPlace.find({
+            status: 'approved',
+            isActive: true,
+            $or: [
+                { city:    { $regex: new RegExp(sanitizedCity, 'i') } },
+                { address: { $regex: new RegExp(sanitizedCity, 'i') } },
+            ]
+        }).lean();
+        console.log(`[UserPlace] Found ${userPlaces.length} community places for ${city}`);
 
-        // Sort by rating descending
-        filteredPlaces.sort((a, b) => (b.rating || 0) - (a.rating || 0));
+        const normalizeUserPlace = (p) => ({
+            id:          p._id.toString(),
+            name:        p.name,
+            imageUrl:    p.mainPhoto || p.photos?.[0] || 'https://images.unsplash.com/photo-1503177119275-0aa32b3a9368?w=600',
+            address:     p.address || p.city || city,
+            rating:      p.rating || 4.0,
+            price:       p.price || 0,
+            lat:         p.lat,
+            lng:         p.lng,
+            category:    p.category || 'activity',
+            type:        p.category || 'activity',
+            city,
+            source:      'community',
+            ownerPhone:  p.ownerPhone,
+            isUserAdded: true,
+        });
 
-        // Group by category for structured response
+        const uHotels      = userPlaces.filter(p => p.category === 'hotel').map(normalizeUserPlace);
+        const uRestaurants = userPlaces.filter(p => p.category === 'restaurant').map(normalizeUserPlace);
+        const uCafes       = userPlaces.filter(p => p.category === 'cafe').map(normalizeUserPlace);
+        const uActivities  = userPlaces.filter(p => ['activity','other'].includes(p.category)).map(normalizeUserPlace);
+
+        const googleHotels = hotels.map(addScore).sort((a,b) => b.valueScore - a.valueScore);
         const grouped = {
-            restaurants: filteredPlaces.filter(p => p.category === 'restaurant'),
-            activities:  filteredPlaces.filter(p => p.category === 'activity' || p.category === 'attraction'),
-            cafes:       filteredPlaces.filter(p => p.category === 'cafe'),
-            beaches:     filteredPlaces.filter(p => p.category === 'beach'),
-            hotels:      hotels, // Include the fetched hotels
-            all:         filteredPlaces,
+            restaurants: [...rankedAll.filter(p => p.category === 'restaurant'), ...uRestaurants.map(addScore)],
+            activities:  [...rankedAll.filter(p => p.category === 'activity' || p.category === 'attraction'), ...uActivities.map(addScore)],
+            cafes:       [...rankedAll.filter(p => p.category === 'cafe'), ...uCafes.map(addScore)],
+            hotels:      [...googleHotels, ...uHotels.map(addScore)],
+            all:         [...rankedAll, ...userPlaces.map(normalizeUserPlace).map(addScore)],
         };
 
-        // Optional AI intro
-        let aiIntro = `اكتشف أجمل ما يقدمه ${city}! 🌟`;
-        try {
-            const prompt = `Write a warm 1-sentence travel intro for "${city}", Egypt. Plain text only, max 20 words.`;
-            const aiResult = await callGemini(prompt);
-            if (aiResult.ok) aiIntro = aiResult.text;
-        } catch (_) { /* non-critical */ }
-
-        const payload = { totalCount: filteredPlaces.length, dataSource, aiIntro, grouped };
-
-        // Cache result in memory
+        const payload = { 
+            totalCount: rankedAll.length + userPlaces.length,
+            communityCount: userPlaces.length,
+            algorithm: 'value_score_v2',
+            aiIntro: `اكتشف أجمل ما يقدمه ${city}! 🌟`, 
+            grouped 
+        };
         citySearchCache.set(cacheKey, payload);
-
-        console.log(`[City Search] ✅ Done — ${filteredPlaces.length} places | source: ${dataSource}\n`);
         return res.status(200).json({ success: true, city, ...payload });
 
     } catch (err) {
-        console.error('[City Search] CRASH:', err.message);
-        const fallback = _hardcodedFallback(city);
-        return res.status(200).json({
-            success: true, city,
-            totalCount: fallback.length,
-            dataSource: 'hardcoded_error_recovery',
-            aiIntro: `اكتشف ${city}! 🌟`,
-            grouped: { all: fallback, restaurants: [], activities: fallback, cafes: [], beaches: [] }
-        });
+        return res.status(500).json({ success: false, message: err.message });
     }
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// NEW: CityExplorer — 50km radius unified discovery
-// GET /api/ai/city-explorer?city=Sharm
-// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/ai/city-explorer
 exports.cityExplorer = async (req, res) => {
     const cityName = (req.query.city || 'Cairo').trim();
     const cityKey = cityName.toLowerCase().replace(/\s+/g, '_');
-    console.log(`[City Explorer] 🗺️ Discovery for ${cityName} within 50km...`);
 
     try {
-        // 1. Check Cache for all 4 categories
         const categories = ['lodging', 'restaurant', 'cafe', 'tourist_attraction'];
         const cacheEntries = await Promise.all(
             categories.map(type => NearbyPlaceCache.findOne({ queryKey: `explorer_${cityKey}_${type}` }))
         );
 
+        let data = { hotels: [], restaurants: [], cafes: [], activities: [] };
+        let center = null;
+
         if (cacheEntries.every(c => c && c.items && c.items.length > 0)) {
-            console.log(`⚡ [City Explorer] Full Cache HIT for ${cityName}`);
-            return res.status(200).json({
-                success: true,
+            data = {
+                hotels:      cacheEntries[0].items,
+                restaurants: cacheEntries[1].items,
+                cafes:       cacheEntries[2].items,
+                activities:  cacheEntries[3].items
+            };
+            center = cacheEntries[0].center;
+        } else {
+            const apiKey = process.env.GOOGLE_MAPS_API_KEY;
+            const geoRes = await axios.get(`https://maps.googleapis.com/maps/api/geocode/json?address=${encodeURIComponent(cityName)}&key=${apiKey}`);
+            if (!geoRes.data.results || geoRes.data.results.length === 0) return res.status(404).json({ success: false, message: "City not found" });
+            
+            const loc = geoRes.data.results[0].geometry.location;
+            center = { lat: loc.lat, lng: loc.lng };
+
+            const results = await Promise.all([
+                _fetchExplorerCategory(loc.lat, loc.lng, 50000, ['lodging'], 'hotel', cityName),
+                _fetchExplorerCategory(loc.lat, loc.lng, 50000, ['restaurant'], 'restaurant', cityName),
+                _fetchExplorerCategory(loc.lat, loc.lng, 50000, ['cafe'], 'cafe', cityName),
+                _fetchExplorerCategory(loc.lat, loc.lng, 50000, ['tourist_attraction'], 'activity', cityName)
+            ]);
+
+            data = { hotels: results[0], restaurants: results[1], cafes: results[2], activities: results[3] };
+
+            // Normalize helper
+            const normalizePlace = (place) => ({
+                id: place.id || place.placeId || `place_${Date.now()}_${Math.random()}`,
+                name: place.name || place.displayName?.text || 'Unknown',
+                imageUrl: place.imageUrl || '',
+                address: place.address || place.formattedAddress || '',
+                rating: place.rating || 4.0,
+                price: place.price || 150,
+                lat: place.lat || place.location?.latitude,
+                lng: place.lng || place.location?.longitude,
+                type: place.type || 'activity',
                 city: cityName,
-                center: cacheEntries[0].center,
-                radius: 50000,
-                grouped: {
-                    hotels:      cacheEntries[0].items,
-                    restaurants: cacheEntries[1].items,
-                    cafes:       cacheEntries[2].items,
-                    activities:  cacheEntries[3].items
-                }
             });
+
+            // Save ALL places to cache with normalized format
+            const allNormalized = [
+                ...data.hotels.map(normalizePlace),
+                ...data.restaurants.map(normalizePlace),
+                ...data.cafes.map(normalizePlace),
+                ...data.activities.map(normalizePlace),
+            ];
+
+            // Cache in chunks by category
+            await Promise.all(categories.map((type, i) => {
+                const items = Object.values(data)[i].map(normalizePlace);
+                return NearbyPlaceCache.findOneAndUpdate(
+                    { queryKey: `explorer_${cityKey}_${type}` },
+                    { 
+                        queryKey: `explorer_${cityKey}_${type}`, 
+                        city: cityName, 
+                        center: { type: 'Point', coordinates: [loc.lng, loc.lat] }, 
+                        items, 
+                        expiresAt: new Date(Date.now() + 2 * 60 * 60 * 1000) 
+                    },
+                    { upsert: true }
+                );
+            }));
         }
 
-        // 2. Geocode City
-        const apiKey = process.env.GOOGLE_MAPS_API_KEY;
-        const geoUrl = `https://maps.googleapis.com/maps/api/geocode/json?address=${encodeURIComponent(cityName)}&key=${apiKey}`;
-        const geoRes = await axios.get(geoUrl);
-        
-        if (!geoRes.data.results || geoRes.data.results.length === 0) {
-            return res.status(404).json({ success: false, message: "City not found" });
-        }
+        // RANKING ALGORITHM
+        console.log(`[Algorithm] Ranking explorer results for ${cityName}...`);
+        const score = (p) => calcValueScore(p, [], 0);
+        const addScore = (p) => ({
+            ...p,
+            valueScore: score(p),
+            scoreBadge: score(p) >= 80 ? '🥇' : score(p) >= 65 ? '🥈' : '🥉'
+        });
 
-        const center = geoRes.data.results[0].geometry.location;
-        const lat = center.lat;
-        const lng = center.lng;
+        // ── Community places: fetch & merge after Google results ──────────────
+        const sanitizedCityName = cityName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const userPlaces = await UserPlace.find({
+            status: 'approved',
+            isActive: true,
+            $or: [
+                { city:    { $regex: new RegExp(sanitizedCityName, 'i') } },
+                { address: { $regex: new RegExp(sanitizedCityName, 'i') } },
+            ]
+        }).lean();
+        console.log(`[UserPlace] Found ${userPlaces.length} community places for ${cityName}`);
 
-        // 3. Parallel Google Places Search (radius 50km)
-        const [hotels, restaurants, cafes, activities] = await Promise.all([
-            _fetchExplorerCategory(lat, lng, 50000, ['lodging'], 'lodging'),
-            _fetchExplorerCategory(lat, lng, 50000, ['restaurant'], 'restaurant'),
-            _fetchExplorerCategory(lat, lng, 50000, ['cafe'], 'cafe'),
-            _fetchExplorerCategory(lat, lng, 50000, ['tourist_attraction'], 'tourist_attraction')
-        ]);
+        const normalizeUserPlace = (p) => ({
+            id:          p._id.toString(),
+            name:        p.name,
+            imageUrl:    p.mainPhoto || p.photos?.[0] || 'https://images.unsplash.com/photo-1503177119275-0aa32b3a9368?w=600',
+            address:     p.address || p.city || cityName,
+            rating:      p.rating || 4.0,
+            price:       p.price || 0,
+            lat:         p.lat,
+            lng:         p.lng,
+            category:    p.category || 'activity',
+            type:        p.category || 'activity',
+            city:        cityName,
+            source:      'community',
+            ownerPhone:  p.ownerPhone,
+            isUserAdded: true,
+        });
 
-        // 4. Cache results per category (TTL 2 hours)
-        const dataMap = { lodging: hotels, restaurant: restaurants, cafe: cafes, tourist_attraction: activities };
-        
-        await Promise.all(categories.map(type => {
-            const items = dataMap[type];
-            return NearbyPlaceCache.findOneAndUpdate(
-                { queryKey: `explorer_${cityKey}_${type}` },
-                {
-                    queryKey: `explorer_${cityKey}_${type}`,
-                    city: cityName,
-                    center: { type: 'Point', coordinates: [lng, lat] },
-                    items: items,
-                    expiresAt: new Date(Date.now() + 2 * 60 * 60 * 1000) // 2 Hours
-                },
-                { upsert: true }
-            );
-        }));
-
-        console.log(`✅ [City Explorer] Discovery complete for ${cityName}. Cached 4 categories.`);
+        const uHotels      = userPlaces.filter(p => p.category === 'hotel').map(normalizeUserPlace).map(addScore);
+        const uRestaurants = userPlaces.filter(p => p.category === 'restaurant').map(normalizeUserPlace).map(addScore);
+        const uCafes       = userPlaces.filter(p => p.category === 'cafe').map(normalizeUserPlace).map(addScore);
+        const uActivities  = userPlaces.filter(p => ['activity','other'].includes(p.category)).map(normalizeUserPlace).map(addScore);
 
         return res.status(200).json({
             success: true,
             city: cityName,
-            center: { lat, lng },
-            radius: 50000,
-            grouped: { hotels, restaurants, cafes, activities }
+            center,
+            algorithm: 'value_score_v2',
+            communityCount: userPlaces.length,
+            grouped: {
+                hotels:      [...data.hotels.map(addScore).sort((a,b) => b.valueScore - a.valueScore),      ...uHotels],
+                restaurants: [...data.restaurants.map(addScore).sort((a,b) => b.valueScore - a.valueScore), ...uRestaurants],
+                cafes:       [...data.cafes.map(addScore).sort((a,b) => b.valueScore - a.valueScore),       ...uCafes],
+                activities:  [...data.activities.map(addScore).sort((a,b) => b.valueScore - a.valueScore),  ...uActivities],
+            }
         });
 
     } catch (err) {
-        console.error(`[City Explorer] CRASH for ${cityName}:`, err.message);
         res.status(500).json({ success: false, message: err.message });
     }
 };
 
-const _fetchExplorerCategory = async (lat, lng, radius, types, categoryLabel) => {
+const _fetchExplorerCategory = async (lat, lng, radius, types, categoryLabel, cityName) => {
     const apiKey = process.env.GOOGLE_MAPS_API_KEY;
     try {
-        const response = await axios.post(
-            'https://places.googleapis.com/v1/places:searchNearby',
-            {
-                includedTypes: types,
-                maxResultCount: 20,
-                locationRestriction: {
-                    circle: {
-                        center: { latitude: lat, longitude: lng },
-                        radius: radius
-                    }
-                }
-            },
-            {
-                headers: {
-                    'Content-Type': 'application/json',
-                    'X-Goog-Api-Key': apiKey,
-                    'X-Goog-FieldMask': 'places.id,places.displayName,places.formattedAddress,places.location,places.rating,places.userRatingCount,places.photos'
-                },
-                timeout: 12000
-            }
+        const response = await axios.post('https://places.googleapis.com/v1/places:searchNearby',
+            { includedTypes: types, maxResultCount: 20, locationRestriction: { circle: { center: { latitude: lat, longitude: lng }, radius } } },
+            { headers: { 'Content-Type': 'application/json', 'X-Goog-Api-Key': apiKey, 'X-Goog-FieldMask': 'places.id,places.displayName,places.formattedAddress,places.location,places.rating,places.userRatingCount,places.photos,places.priceLevel,places.currentOpeningHours,places.editorialSummary,places.regularOpeningHours,places.internationalPhoneNumber,places.websiteUri,places.types' }, timeout: 12000 }
         );
-
         const places = response.data.places || [];
-        return places.map(p => {
-            let imageUrl = 'https://images.unsplash.com/photo-1544005313-94ddf0286df2?w=600';
-            if (p.photos && p.photos.length > 0) {
-                const photoReference = p.photos[0].name;
-                imageUrl = `https://places.googleapis.com/v1/${photoReference}/media?maxHeightPx=400&maxWidthPx=400&key=${apiKey}`;
-            }
-
-            return {
-                id: p.id,
-                name: p.displayName?.text || 'Unknown',
-                rating: p.rating || 4.0,
-                price: 150,
-                imageUrl: imageUrl,
-                address: p.formattedAddress || '',
-                lat: p.location?.latitude,
-                lng: p.location?.longitude,
-                type: categoryLabel
-            };
-        });
-    } catch (err) {
-        console.warn(`[City Explorer] Google fetch failed for ${categoryLabel}: ${err.message}`);
-        return [];
-    }
+        return places.map(p => normalizeGooglePlace(p, categoryLabel, cityName));
+    } catch (err) { return []; }
 };
 
-// ── Private helpers ───────────────────────────────────────────────────────────
 function _estimatePrice(category) {
     const prices = { restaurant: 150, cafe: 80, activity: 200, beach: 0, hotel: 1200, attraction: 100 };
     return prices[category] || 100;

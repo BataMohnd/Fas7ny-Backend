@@ -4,6 +4,8 @@ const Hotel = require('../models/HotelModel');
 const Place = require('../models/Place'); // Added Place model reference
 const NearbyPlaceCache = require('../models/NearbyPlaceCache');
 const crypto = require('crypto');
+const { enrichPlacesWithPhotos } = require('../utils/photoEnricher');
+const { normalizeHotelPrice }    = require('../utils/currencyConverter');
 
 // 1. Triple-Source Fallback Data (Static as last resort)
 const staticFallbackData = [
@@ -69,23 +71,29 @@ exports.getHotels = async (req, res) => {
                 response.data?.data ||
                 (Array.isArray(response.data) ? response.data : []);
 
-            hotels = rawData.map(h => ({
+            const rawHotels = rawData.map(h => ({
                 hotelId: (h.hotel_id || h.property_id || h.id || crypto.randomUUID()).toString(),
                 cityId: cityId,
                 hotelName: h.hotel_name || h.property_name || h.name || 'Unknown Hotel',
                 mainPhotoUrl: h.main_photo_url || h.mainPhotoUrl || (h.photoUrls && h.photoUrls.length > 0 ? h.photoUrls[0] : null),
                 address: h.address || h.address_trans || 'Unknown Address',
                 city: h.city || '',
-                price: req.formatPrice
-                    ? req.formatPrice(h.price || h.min_total_price || h.compositePrice || 500)
-                    : (h.price || h.min_total_price || h.compositePrice || 500),
-                currency: req.userCurrency || 'EGP',
+                _rawPrice: h.price || h.min_total_price || h.compositePrice || 500,
+                _rawCurrency: h.currency || h.currency_code || 'USD',
+                currency: 'EGP',
                 reviewScore: (h.review_score || h.reviewScore || 0.0),
                 rating: (h.review_score || h.reviewScore || 4.5),
                 image: h.main_photo_url || h.mainPhotoUrl,
                 reviewCount: (h.review_nr || h.reviewCount || 0)
             }));
-            console.log(`✅ RapidAPI Success: Extracted ${hotels.length} hotels.`);
+
+            // Normalize all prices to EGP in parallel
+            hotels = await Promise.all(rawHotels.map(async h => {
+                const { priceEGP } = await normalizeHotelPrice({ price: h._rawPrice, currency: h._rawCurrency });
+                const { _rawPrice, _rawCurrency, ...rest } = h;
+                return { ...rest, price: priceEGP, currency: 'EGP' };
+            }));
+            console.log(`✅ RapidAPI Success: Extracted ${hotels.length} hotels (prices in EGP).`);
 
         } catch (apiError) {
             console.warn("⚠️ RapidAPI Failed, trying MongoDB...");
@@ -149,6 +157,10 @@ exports.getHotels = async (req, res) => {
         console.log(`🤖 Sentiment processing started for top 3 hotels (Max wait: 4s)...`);
         await Promise.allSettled(sentimentPromises);
         console.log(`⚡ Returning ${hotels.length} hotels comfortably within timeout limits.`);
+
+        // Enrich images — fill any missing/placeholder photos with real Google Places photos
+        const city = (hotels[0]?.city || hotels[0]?.address || '').split(',')[0].trim() || 'Egypt';
+        hotels = await enrichPlacesWithPhotos(hotels, city);
 
         res.status(200).json({ success: true, source, data: hotels });
 
@@ -301,6 +313,10 @@ exports.searchPlaces = async (req, res) => {
                 console.error("🚨 Search Fallback Failed:", fallbackError.message);
             }
         }
+
+        // Enrich images before responding
+        const searchCity = (req.query.city || '').trim() || 'Egypt';
+        combinedResults = await enrichPlacesWithPhotos(combinedResults, searchCity);
 
         res.status(200).json({
             success: true,
@@ -513,11 +529,14 @@ exports.getNearbyAttractions = async (req, res) => {
             category: { $in: ['cafe', 'restaurant', 'attraction'] }
         }).limit(5);
 
+        const attrOutput = finalResults.length > 0 ? finalResults : newPlacesToInsert.slice(0, 5);
+        const enrichedAttr = await enrichPlacesWithPhotos(attrOutput, cityContext);
+
         res.status(200).json({
             message: "Live fetch successful & cached",
             source: "serper",
-            count: finalResults.length,
-            data: finalResults.length > 0 ? finalResults : newPlacesToInsert.slice(0, 5)
+            count: enrichedAttr.length,
+            data: enrichedAttr
         });
 
     } catch (error) {
@@ -649,6 +668,9 @@ exports.getNearbyPlaces = async (req, res) => {
                 },
                 { upsert: true, new: true }
             );
+
+            // Enrich images for nearby places
+            items = await enrichPlacesWithPhotos(items, city || 'Egypt');
 
             return res.status(200).json({
                 success: true,
@@ -927,7 +949,10 @@ exports.getHotelsByCity = async (req, res) => {
             { upsert: true, returnDocument: 'after' }
         );
 
-        return res.status(200).json({ success: true, source: 'google_places', data: hotels });
+        // Enrich images — Google Places hotels from new API may have photo refs, fill missing ones
+        const enrichedHotels = await enrichPlacesWithPhotos(hotels, city);
+
+        return res.status(200).json({ success: true, source: 'google_places', data: enrichedHotels });
 
     } catch (err) {
         console.error("[Google Hotels] Error:", err.message);

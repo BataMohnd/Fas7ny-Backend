@@ -8,7 +8,8 @@ const app = express();
 
 // ── Middlewares ─────────────────────────────────────────────────────────────
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
 // 🔠 Global UTF-8 Encoding for Emoji & Arabic support
 app.use((req, res, next) => {
@@ -40,6 +41,15 @@ app.use('/api/v2/trips', require('./routes/api/trips'));
 app.use('/api/ratings', require('./routes/api/ratings'));
 app.use('/api/notifications', require('./routes/api/notifications'));
 app.use('/api/chat', require('./routes/api/chat'));
+app.use('/api/user-places', require('./routes/userPlaceRoutes'));
+app.use('/api/comments',    require('./routes/commentRoutes'));
+app.use('/api/transport',   require('./routes/transportRoutes'));
+
+// 🗓️ AI Smart Day Planner Routes
+const smartPlannerController = require('./controllers/smartPlannerController');
+app.post('/api/trips/smart-plan', smartPlannerController.generateSmartPlan);
+app.get('/api/trips/smart-plans/:userId', smartPlannerController.getUserPlans);
+app.delete('/api/trips/smart-plans/:planId', smartPlannerController.deletePlan);
 
 // ── Feature 4: Trip Quality Analysis ──────────────────────────────────
 const tripAnalysisController = require('./controllers/tripAnalysisController');

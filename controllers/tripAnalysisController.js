@@ -6,15 +6,6 @@ const User     = require('../models/User');
  * GET /api/trips/analysis/:userId
  *
  * Returns aggregated comparison between manual and AI-generated trips:
- * {
- *   success: true,
- *   totalTrips: 12,
- *   manualCount: 8,     aiCount: 4,
- *   manualAvgCost: 3200, aiAvgCost: 2800,
- *   interestCoverage: 0.65,   // 0..1 fraction of user interests covered
- *   avgRating: 4.2,
- *   costTrend: [...]           // monthly cost data for line chart
- * }
  */
 exports.getTripAnalysis = async (req, res) => {
     try {
@@ -37,38 +28,66 @@ exports.getTripAnalysis = async (req, res) => {
             });
         }
 
-        const manualBookings = allBookings.filter(b => (b.source || 'manual') === 'manual');
-        const aiBookings     = allBookings.filter(b => b.source === 'ai');
+        // Robust source filtering
+        const aiBookings = allBookings.filter(b => 
+            b.source === 'ai' || b.source === 'AI' || b.source === 'smart_plan'
+        );
+        const manualBookings = allBookings.filter(b => 
+            !aiBookings.some(ai => ai._id?.toString() === b._id?.toString())
+        );
 
-        // ── 2. Cost averages ──────────────────────────────────────────────────
-        const avg = (arr, field) => arr.length > 0
-            ? arr.reduce((s, b) => s + (b[field] || 0), 0) / arr.length
+        console.log(`[Trip Analysis] User: ${userId} | Total: ${allBookings.length} | Manual: ${manualBookings.length} | AI: ${aiBookings.length}`);
+        console.log(`[Trip Analysis] Sources found:`, [...new Set(allBookings.map(b => b.source || 'undefined'))]);
+
+        // ── 2. Cost averages (Fixed calculation with realistic filter) ────────
+        // Filter realistic booking prices (real bookings are between 50 and 50,000 EGP)
+        const realisticManual = manualBookings.filter(b => b.totalPrice > 0 && b.totalPrice < 50000);
+        const realisticAI     = aiBookings.filter(b => b.totalPrice > 0 && b.totalPrice < 50000);
+
+        const manualAvgCost = realisticManual.length > 0
+            ? realisticManual.reduce((sum, b) => sum + (b.totalPrice || 0), 0) / realisticManual.length
             : 0;
 
-        const manualAvgCost = avg(manualBookings, 'totalPrice');
-        const aiAvgCost     = avg(aiBookings,     'totalPrice');
+        const aiAvgCost = realisticAI.length > 0
+            ? realisticAI.reduce((sum, b) => sum + (b.totalPrice || 0), 0) / realisticAI.length
+            : 0;
 
-        // ── 3. Interest coverage metric ───────────────────────────────────────
-        // Fraction of user's interests that appear in any booking's interestTags
+        console.log(`[Trip Analysis] Manual avg: ${Math.round(manualAvgCost)} EGP | AI avg: ${Math.round(aiAvgCost)} EGP`);
+
+        // ── 3. Interest coverage metric (Enhanced) ────────────────────────────
         let interestCoverage = 0;
-        try {
-            const user = await User.findOne({ $or: [{ _id: userId }, { uid: userId }] }).select('interests');
-            const interests = (user?.interests || []).map(i => i.toLowerCase());
-            if (interests.length > 0) {
-                const coveredTags = new Set(allBookings.flatMap(b => (b.interestTags || [])));
-                const matched = interests.filter(i => [...coveredTags].some(tag => tag.includes(i) || i.includes(tag)));
-                interestCoverage = parseFloat((matched.length / interests.length).toFixed(2));
-            }
-        } catch (_) { /* non-critical */ }
+        const user = await User.findOne({ $or: [{ _id: userId }, { uid: userId }] }).select('interests');
+        const userInterests = (user?.interests || []).map(i => i.toLowerCase());
 
-        // ── 4. Average rating from Rating collection ──────────────────────────
-        let avgRating = 0;
-        try {
-            const ratings = await Rating.find({ userId }).lean();
-            if (ratings.length > 0) {
-                avgRating = parseFloat((ratings.reduce((s, r) => s + (r.score || r.rating || 0), 0) / ratings.length).toFixed(1));
-            }
-        } catch (_) { /* Rating collection may be empty */ }
+        if (userInterests.length > 0) {
+            const coveredInterests = userInterests.filter(interest =>
+                allBookings.some(b =>
+                    (b.placeName || '').toLowerCase().includes(interest.toLowerCase()) ||
+                    (b.placeType || '').toLowerCase().includes(interest.toLowerCase()) ||
+                    (b.interestTags || []).some(tag => tag.toLowerCase().includes(interest.toLowerCase()))
+                )
+            );
+            interestCoverage = parseFloat((coveredInterests.length / userInterests.length).toFixed(2));
+        } else {
+            // No interests set → diversity score (max 4 unique place types = 100%)
+            const placeTypes = [...new Set(allBookings.map(b => b.placeType).filter(Boolean))];
+            const uniqueTypeCount = Math.min(placeTypes.length, 4); // cap at 4
+            interestCoverage = uniqueTypeCount / 4.0; // returns 0.0 to 1.0
+            console.log(`[Trip Analysis] Diversity types: ${placeTypes.join(', ')} → ${Math.round(interestCoverage * 100)}%`);
+        }
+
+        // ── 4. Average rating (Estimated if missing) ─────────────────────────
+        const avgRatingValue = allBookings.length > 0
+            ? allBookings.reduce((sum, b) => {
+                const rating = b.rating ||
+                    (b.totalPrice > 2000 ? 4.5 :
+                     b.totalPrice > 1000 ? 4.2 :
+                     b.totalPrice > 500  ? 4.0 : 3.8);
+                return sum + rating;
+            }, 0) / allBookings.length
+            : 0;
+        
+        const avgRating = parseFloat(avgRatingValue.toFixed(1));
 
         // ── 5. Monthly cost trend (last 6 months) ─────────────────────────────
         const now = new Date();
@@ -91,8 +110,6 @@ exports.getTripAnalysis = async (req, res) => {
         const activityBookings = allBookings.filter(b => ['activity', 'attraction', 'restaurant', 'cafe'].includes(b.placeType));
         const hotelBookings    = allBookings.filter(b => b.placeType === 'hotel');
 
-        console.log(`[Trip Analysis] User: ${userId} | Total: ${allBookings.length} | Manual: ${manualBookings.length} | AI: ${aiBookings.length} | Coverage: ${interestCoverage}`);
-
         return res.status(200).json({
             success: true,
             totalTrips: allBookings.length,
@@ -100,7 +117,7 @@ exports.getTripAnalysis = async (req, res) => {
             aiCount: aiBookings.length,
             manualAvgCost: Math.round(manualAvgCost),
             aiAvgCost: Math.round(aiAvgCost),
-            interestCoverage,                          // 0.0 – 1.0
+            interestCoverage: parseFloat((interestCoverage * 100).toFixed(0)), // Return as percentage for UI
             avgRating,
             activityCount: activityBookings.length,
             hotelCount: hotelBookings.length,
@@ -149,7 +166,10 @@ exports.getPlaceComparison = async (req, res) => {
                     id: booking.placeId,
                     name: booking.placeName || 'Unknown',
                     price: booking.totalPrice || 0,
-                    rating: booking.rating || (Math.random() * 2 + 3), // Fallback rating if none stored
+                    rating: booking.rating || 
+                           (booking.totalPrice > 2000 ? 4.5 :
+                            booking.totalPrice > 1000 ? 4.2 :
+                            booking.totalPrice > 500  ? 4.0 : 3.8),
                     bookingDate: booking.createdAt || booking.checkIn
                 });
             }
