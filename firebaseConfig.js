@@ -5,9 +5,12 @@ const fs = require('fs');
 const serviceAccountPath = path.join(__dirname, 'serviceAccountKey.json');
 
 try {
-    if (fs.existsSync(serviceAccountPath)) {
+    const serviceAccountJson = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
+    if (serviceAccountJson || fs.existsSync(serviceAccountPath)) {
         // ✅ Real mode: use the service account file
-        const serviceAccount = JSON.parse(fs.readFileSync(serviceAccountPath, 'utf8'));
+        const serviceAccount = JSON.parse(
+            serviceAccountJson || fs.readFileSync(serviceAccountPath, 'utf8')
+        );
         if (!admin.apps.length) {
             admin.initializeApp({
                 credential: admin.credential.cert(serviceAccount),
@@ -16,7 +19,7 @@ try {
         }
         // ── Startup Diagnostics ───────────────────────────────────────────
         console.log(`🔥 Firebase Admin initialized`);
-        console.log(`   ├─ Credential source : serviceAccountKey.json`);
+        console.log(`   ├─ Credential source : ${serviceAccountJson ? 'environment variable' : 'serviceAccountKey.json'}`);
         console.log(`   ├─ Project ID        : ${admin.app().options.projectId}`);
         console.log(`   └─ Service account   : ${serviceAccount.client_email}`);
         console.log(`   ⚠️  Flutter app must use this SAME project: ${admin.app().options.projectId}`);

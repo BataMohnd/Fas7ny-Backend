@@ -57,7 +57,7 @@ exports.getHotels = async (req, res) => {
                     locale: 'en_gb'
                 },
                 headers: {
-                    'x-rapidapi-key': process.env.RAPIDAPI_KEY || '931526fb46msh984a7bdb7ab2e90p14f6b6jsn84db4c6f3237',
+                    'x-rapidapi-key': process.env.RAPIDAPI_KEY,
                     'x-rapidapi-host': 'apidojo-booking-v1.p.rapidapi.com'
                 }
             };
@@ -255,7 +255,7 @@ exports.searchPlaces = async (req, res) => {
                 const locationRes = await axios.get('https://apidojo-booking-v1.p.rapidapi.com/locations/v2/search', {
                     params: { name: query, locale: 'en-gb' },
                     headers: {
-                        'x-rapidapi-key': process.env.RAPIDAPI_KEY || '931526fb46msh984a7bdb7ab2e90p14f6b6jsn84db4c6f3237',
+                        'x-rapidapi-key': process.env.RAPIDAPI_KEY,
                         'x-rapidapi-host': 'apidojo-booking-v1.p.rapidapi.com'
                     }
                 });
@@ -276,7 +276,7 @@ exports.searchPlaces = async (req, res) => {
                             units: 'metric'
                         },
                         headers: {
-                            'x-rapidapi-key': process.env.RAPIDAPI_KEY || '931526fb46msh984a7bdb7ab2e90p14f6b6jsn84db4c6f3237',
+                            'x-rapidapi-key': process.env.RAPIDAPI_KEY,
                             'x-rapidapi-host': 'apidojo-booking-v1.p.rapidapi.com'
                         }
                     });
@@ -352,7 +352,7 @@ exports.getAttractionAvailability = async (req, res) => {
                 currency: req.userCurrency || 'EGP'
             },
             headers: {
-                'x-rapidapi-key': process.env.RAPIDAPI_KEY || '931526fb46msh984a7bdb7ab2e90p14f6b6jsn84db4c6f3237',
+                'x-rapidapi-key': process.env.RAPIDAPI_KEY,
                 'x-rapidapi-host': 'booking-com.p.rapidapi.com'
             }
         };
@@ -799,7 +799,7 @@ exports.getNearbyHotels = async (req, res) => {
                         locale: 'en_gb'
                     },
                     headers: {
-                        'x-rapidapi-key': process.env.RAPIDAPI_KEY || '931526fb46msh984a7bdb7ab2e90p14f6b6jsn84db4c6f3237',
+                        'x-rapidapi-key': process.env.RAPIDAPI_KEY,
                         'x-rapidapi-host': 'apidojo-booking-v1.p.rapidapi.com'
                     }
                 };

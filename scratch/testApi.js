@@ -1,7 +1,8 @@
 const axios = require('axios');
+require('dotenv').config();
 
 async function testTripadvisor() {
-    const apiKey = '931526fb46msh984a7bdb7ab2e90p14f6b6jsn84db4c6f3237';
+    const apiKey = process.env.RAPIDAPI_KEY;
     const host = 'tripadvisor16.p.rapidapi.com';
 
     try {

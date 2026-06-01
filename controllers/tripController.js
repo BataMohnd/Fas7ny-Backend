@@ -2,7 +2,7 @@ const axios = require('axios');
 const { callGemini } = require('../utils/geminiClient');
 const Place = require('../models/Place');
 
-const RAPID_API_KEY = process.env.RAPIDAPI_KEY || '931526fb46msh984a7bdb7ab2e90p14f6b6jsn84db4c6f3237';
+const RAPID_API_KEY = process.env.RAPIDAPI_KEY;
 const RAPID_API_HOST = 'tripadvisor16.p.rapidapi.com';
 const BASE_URL = `https://${RAPID_API_HOST}/api/v1`;
 

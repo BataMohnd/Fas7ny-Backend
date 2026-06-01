@@ -14,7 +14,7 @@ exports.getAttractionAvailability = async (req, res) => {
             currency: 'AED'
         },
         headers: {
-            'x-rapidapi-key': '931526fb46msh984a7bdb7ab2e90p14f6b6jsn84db4c6f3237',
+            'x-rapidapi-key': process.env.RAPIDAPI_KEY,
             'x-rapidapi-host': 'booking-com.p.rapidapi.com'
         }
     };
