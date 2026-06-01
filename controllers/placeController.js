@@ -2,6 +2,7 @@ const axios = require('axios');
 const mongoose = require('mongoose');
 const Hotel = require('../models/HotelModel');
 const Place = require('../models/Place'); // Added Place model reference
+const NearbyPlaceCache = require('../models/NearbyPlaceCache');
 const crypto = require('crypto');
 
 // 1. Triple-Source Fallback Data (Static as last resort)
@@ -60,16 +61,13 @@ exports.getHotels = async (req, res) => {
             };
 
             const response = await axios.request(options);
-            console.log('Raw API Response:', JSON.stringify(response.data, null, 2));
-
+            
             // Support multiple response shapes from Booking.com RapidAPI
             const rawData =
                 response.data?.result ||
                 response.data?.data?.results ||
                 response.data?.data ||
                 (Array.isArray(response.data) ? response.data : []);
-
-            console.log(`📦 Extracted ${rawData.length} hotels from API`);
 
             hotels = rawData.map(h => ({
                 hotelId: (h.hotel_id || h.property_id || h.id || crypto.randomUUID()).toString(),
@@ -83,44 +81,80 @@ exports.getHotels = async (req, res) => {
                     : (h.price || h.min_total_price || h.compositePrice || 500),
                 currency: req.userCurrency || 'EGP',
                 reviewScore: (h.review_score || h.reviewScore || 0.0),
-                rating: (h.review_score || h.reviewScore || 4.5), // Maps to rating or default
-                image: h.main_photo_url || h.mainPhotoUrl, // Explicitly map to image
+                rating: (h.review_score || h.reviewScore || 4.5),
+                image: h.main_photo_url || h.mainPhotoUrl,
                 reviewCount: (h.review_nr || h.reviewCount || 0)
             }));
-            console.log("✅ RapidAPI Success (Dynamic)");
+            console.log(`✅ RapidAPI Success: Extracted ${hotels.length} hotels.`);
+
         } catch (apiError) {
             console.warn("⚠️ RapidAPI Failed, trying MongoDB...");
             source = 'mongodb';
-            const dbHotels = await Hotel.find({ cityId: cityId });
-
-            if (dbHotels.length > 0) {
-                hotels = dbHotels.map(h => ({
-                    hotelId: h.hotelId,
-                    hotelName: h.hotelName,
-                    mainPhotoUrl: h.mainPhotoUrl || h.image_url,
-                    image: h.image_url || h.mainPhotoUrl, // Added for UI sync request
-                    address: h.address,
-                    price: req.formatPrice ? req.formatPrice(h.price || 500) : h.price,
-                    currency: req.userCurrency || 'EGP', // Dynamic injection
-                    rating: 4.5, // Default as requested
-                    reviewCount: h.reviewCount || 0
-                }));
-                console.log("✅ Dynamic Injection Success");
-            } else {
-                console.warn("⚠️ MongoDB Empty, falling back to Static Data...");
+            try {
+                const dbHotels = await Hotel.find({ cityId: cityId });
+                if (dbHotels.length > 0) {
+                    hotels = dbHotels.map(h => ({
+                        hotelId: h.hotelId,
+                        hotelName: h.hotelName,
+                        mainPhotoUrl: h.mainPhotoUrl || h.image_url,
+                        image: h.image_url || h.mainPhotoUrl,
+                        address: h.address,
+                        price: req.formatPrice ? req.formatPrice(h.price || 500) : h.price,
+                        currency: req.userCurrency || 'EGP',
+                        rating: 4.5,
+                        reviewCount: h.reviewCount || 0
+                    }));
+                    console.log("✅ MongoDB Injection Success");
+                } else {
+                    console.warn("⚠️ MongoDB Empty, falling back to Static Data...");
+                    source = 'static';
+                    hotels = staticFallbackData.map(h => ({
+                        ...h,
+                        price: req.formatPrice ? req.formatPrice(h.price) : h.price,
+                        currency: req.userCurrency || 'EGP'
+                    }));
+                }
+            } catch (dbErr) {
+                console.error("❌ MongoDB Fetch Error:", dbErr.message);
                 source = 'static';
-                hotels = staticFallbackData.map(h => ({
-                    ...h,
-                    price: req.formatPrice ? req.formatPrice(h.price) : h.price,
-                    currency: req.userCurrency || 'EGP'
-                }));
+                hotels = staticFallbackData.map(h => ({ ...h, currency: 'EGP' }));
             }
         }
 
-        console.log(`✅ Success from ${source}`);
+        // 2. Optimized Response Timing (Bounded Concurrency & Timeouts)
+        const { generateSentimentSummary } = require('../services/sentimentAnalyzer');
+
+        /**
+         * ⏲️ Timeout Wrapper Helper
+         */
+        const withTimeout = (promise, ms = 4000) => {
+            return Promise.race([
+                promise,
+                new Promise((_, reject) => setTimeout(() => reject(new Error('Sentiment timeout')), ms))
+            ]);
+        };
+
+        // Process sentiment ONLY for top 3 hotels concurrently
+        const sentimentPromises = hotels.slice(0, 3).map(async (h) => {
+            if (h.sentimentSummary) return;
+            try {
+                h.sentimentSummary = await withTimeout(generateSentimentSummary(h.rating || 4.5, h.address));
+                Hotel.updateOne({ hotelId: h.hotelId }, { sentimentSummary: h.sentimentSummary }).catch(e => {});
+            } catch (err) {
+                console.warn(`⚠️ [Sentiment Fallback] ${h.hotelName}: ${err.message}`);
+                h.sentimentSummary = "تجربة سياحية مميزة تم تقييمها بعناية لتناسب تفضيلاتك.";
+            }
+        });
+
+        console.log(`🤖 Sentiment processing started for top 3 hotels (Max wait: 4s)...`);
+        await Promise.allSettled(sentimentPromises);
+        console.log(`⚡ Returning ${hotels.length} hotels comfortably within timeout limits.`);
+
         res.status(200).json({ success: true, source, data: hotels });
+
     } catch (err) {
-        res.status(500).json({ success: false, message: err.message });
+        console.error('🔥 CRITICAL ERROR IN getHotels:', err.message);
+        res.status(500).json({ success: false, message: "فشل في جلب بيانات الفنادق. يرجى المحاولة لاحقاً." });
     }
 };
 
@@ -153,79 +187,53 @@ exports.getHotelDetails = async (req, res) => {
     }
 };
 
-// 2. البحث عن الأماكن (Universal Fallback)
+// 2. البحث عن الأماكن (Wallet-Aware Search)
 exports.searchPlaces = async (req, res) => {
     try {
-        const query = req.query.name;
-        if (!query) return res.status(200).json({ success: true, data: [] });
+        const query = req.query.name || req.query.query;
+        const city = req.query.city;
+        const budget = parseFloat(req.query.budget);
 
-        const regex = { $regex: query, $options: 'i' };
+        let filter = {};
 
-        // Search Hotels: hotelName, address, city, room_type, description
-        const hotelsRaw = await Hotel.find({
-            $or: [
-                { hotelName: regex },
-                { address: regex },
-                { city: regex },
-                { room_type: regex },
-                { description: regex }
-            ]
-        }).limit(20);
+        if (city) {
+            filter.city = new RegExp(city, 'i');
+        }
 
-        // Search Places: name, neighbourhood, category, description
-        const placesRaw = await Place.find({
-            $or: [
-                { name: regex },
-                { neighbourhood: regex },
-                { category: regex },
-                { description: regex }
-            ]
-        }).limit(20);
+        if (query) {
+            filter.$or = [
+                { name: new RegExp(query, 'i') },
+                { description: new RegExp(query, 'i') }
+            ];
+        }
 
-        // Scoring Function for Relevance
-        const scoreMatch = (item, q) => {
-            const name = (item.hotelName || item.name || "").toLowerCase();
-            const qLow = q.toLowerCase();
-            if (name === qLow) return 100;
-            if (name.startsWith(qLow)) return 80;
-            if (name.includes(qLow)) return 60;
-            return 40; // Location or description match
-        };
+        let combinedResults = [];
 
-        // Sync Hotels with injection
-        const hotels = hotelsRaw.map(h => ({
-            hotelId: h.hotelId,
-            hotelName: h.hotelName,
-            mainPhotoUrl: h.mainPhotoUrl || h.image_url,
-            image: h.image_url || h.mainPhotoUrl,
-            address: h.address,
-            price: req.formatPrice ? req.formatPrice(h.price || 500) : h.price,
-            currency: req.userCurrency || 'EGP',
-            rating: 4.5,
-            reviewCount: h.reviewCount || 0,
-            source: 'mongo',
-            relevanceScore: scoreMatch(h, query)
-        }));
+        // If budget is provided, apply Wallet-Aware Logic
+        if (!isNaN(budget) && budget > 0) {
+            // Find affordable places prioritizing those under 50% of budget
+            combinedResults = await Place.find({
+                ...filter,
+                price: { $lte: budget }
+            }).sort({ price: 1 }).limit(20).lean();
+        } else {
+            combinedResults = await Place.find(filter).limit(20).lean();
+        }
 
-        // Sync Places with injection
-        const places = placesRaw.map(p => ({
-            id: p._id,
+        // Map data consistently
+        combinedResults = combinedResults.map(p => ({
+            id: p._id || p.id,
             name: p.name,
-            imageUrl: p.imageUrl,
+            imageUrl: p.imageUrl || p.image_url || p.mainPhotoUrl || 'https://via.placeholder.com/150',
             price: p.price,
-            neighbourhood: p.neighbourhood,
-            currency: req.userCurrency || 'EGP',
-            rating: 4.5,
+            category: p.category || 'General',
+            neighbourhood: p.neighbourhood || p.city,
+            currency: 'EGP',
+            rating: p.rating || 4.5,
             numberOfReviews: p.numberOfReviews || 0,
             description: p.description,
-            source: 'mongo',
-            relevanceScore: scoreMatch(p, query)
+            source: 'mongo'
         }));
-
-        // Combine and limit total results to 20 for top performance, sorted by relevance
-        let combinedResults = [...places, ...hotels]
-            .sort((a, b) => b.relevanceScore - a.relevanceScore)
-            .slice(0, 20);
 
         // --- ENHANCED FALLBACK: Trigger RapidAPI if 0 results found ---
         if (combinedResults.length === 0) {
@@ -378,21 +386,27 @@ exports.getNearbyAttractions = async (req, res) => {
     try {
         const { lng, lat, maxDistance = 2000 } = req.query;
 
+        // -- STEP 0: Ground Truth Coordinate Resolver --
         let numericLat = parseFloat(lat);
         let numericLng = parseFloat(lng);
+        let cityContext = "Cairo";
 
-        // -- STEP 0: Smart Location Handler (Alexandria Bridge) --
-        if (isNaN(numericLat) || isNaN(numericLng)) {
-            const cityMap = {
-                '-3712125': { lat: 30.0444, lng: 31.2357 }, // Cairo
-                '-3712078': { lat: 31.2001, lng: 29.9187 }, // Alexandria
-                '8': { lat: 25.2048, lng: 55.2708 }          // Dubai
-            };
-            const cityId = req.query.cityId || '-3712125';
-            const coords = cityMap[cityId] || cityMap['-3712125'];
-            numericLat = coords.lat;
-            numericLng = coords.lng;
-            console.log(`📍 NN Intelligence: Defaulting to ${cityId === '-3712078' ? 'Alexandria' : 'Cairo'} coordinates [${numericLat}, ${numericLng}]`);
+        const cityMap = {
+            '-3712125': { name: "Cairo", lat: 30.0444, lng: 31.2357 },
+            '8': { name: "Dubai", lat: 25.2048, lng: 55.2708 },
+            '-3712078': { name: "Alexandria", lat: 31.2001, lng: 29.9187 }
+        };
+
+        const cityId = req.query.cityId || '-3712125';
+        const verified = cityMap[cityId];
+
+        if (verified) {
+            if (isNaN(numericLat) || isNaN(numericLng)) {
+                numericLat = verified.lat;
+                numericLng = verified.lng;
+                console.log(`📍 NN Logic: Using Verified Demo Coordinates for ${verified.name} [${numericLat}, ${numericLng}]`);
+            }
+            cityContext = verified.name;
         }
 
         // -- STEP 1: Search MongoDB Cache (2dsphere $near) --
@@ -421,23 +435,39 @@ exports.getNearbyAttractions = async (req, res) => {
         }
 
         // -- STEP 2: Cache Miss, trigger live Serper API --
-        console.log("⚠️ NN Cache Miss! Fetching live from Serper API...");
+        console.log(`⚠️ NN Cache Miss! Fetching live from Serper API...`);
         const serperKey = process.env.SERPER_API_KEY;
+        const serperUrl = 'https://google.serper.dev/places';
+        
         if (!serperKey) {
-            return res.status(200).json({ data: [] }); // Disable gracefully if no key
+            return res.status(200).json({ success: true, source: "fallback", data: _getCuratedFallback(cityContext) });
         }
 
-        const serperRes = await axios.post('https://google.serper.dev/places', {
-            q: `Cafes and restaurants near ${numericLat}, ${numericLng}`,
-            location: `${numericLat},${numericLng}`
-        }, {
-            headers: {
-                'X-API-KEY': serperKey,
-                'Content-Type': 'application/json'
+        let rawPlaces = [];
+        try {
+            console.log(`📡 [Serper API] Requesting neighborhood data: POST ${serperUrl}`);
+            const serperRes = await axios.post(serperUrl, {
+                q: `Cafes, restaurants and attractions near ${numericLat}, ${numericLng}`,
+                location: `${numericLat},${numericLng}`
+            }, {
+                headers: { 'X-API-KEY': serperKey, 'Content-Type': 'application/json' },
+                timeout: 8000
+            });
+            console.log(`✅ [Serper API] Response: ${serperRes.status} OK`);
+            rawPlaces = serperRes.data?.places || [];
+        } catch (e) {
+            const status = e.response?.status;
+            console.error(`❌ [Serper API] External Provider Error: [Status ${status}] | URL: ${serperUrl}`);
+            if (status === 403) {
+                console.warn(`⚠️ Auth Failure (403): Triggering [${cityContext}] curated neighborhood fallback.`);
+                return res.status(200).json({
+                    success: true,
+                    message: "Using curated demo fallback",
+                    source: "curated_fallback",
+                    data: _getCuratedFallback(cityContext)
+                });
             }
-        });
-
-        const rawPlaces = serperRes.data?.places || [];
+        }
         
         if (rawPlaces.length === 0) {
            return res.status(200).json({ data: [] });
@@ -495,3 +525,415 @@ exports.getNearbyAttractions = async (req, res) => {
         res.status(500).json({ error: "Failed to fetch nearby places" });
     }
 };
+
+/**
+ * 🏗️ Curated Demo-Ready Neighborhood Fallbacks
+ */
+function _getCuratedFallback(city) {
+    const c = city.toLowerCase();
+    if (c.includes('cairo')) return [
+        { name: 'Naguib Mahfouz Cafe', category: 'restaurant', rating: 4.8, imageUrl: 'https://images.unsplash.com/photo-1553913861-c0fddf2619ee', description: 'Famous historical cafe in Khan El Khalili' },
+        { name: 'Abou El Sid', category: 'restaurant', rating: 4.6, imageUrl: 'https://images.unsplash.com/photo-1606491956689-2ea866880c84', description: 'Classic Egyptian dining experience in Zamalek' },
+        { name: 'Zeba', category: 'cafe', rating: 4.5, imageUrl: 'https://images.unsplash.com/photo-1554118811-1e0d58224f24', description: 'Modern cozy cafe with Nile view' }
+    ];
+    if (c.includes('alex')) return [
+        { name: 'Greek Club', category: 'restaurant', rating: 4.7, imageUrl: 'https://images.unsplash.com/photo-1544124499-58912cbddaad', description: 'Iconic view of the Eastern Harbor' },
+        { name: 'Fish Market', category: 'restaurant', rating: 4.8, imageUrl: 'https://images.unsplash.com/photo-1519708227418-c8fd9a32b7a2', description: 'Fresh Mediterranean seafood' }
+    ];
+    return [{ name: 'Modern Egyptian Resto', category: 'restaurant', rating: 4.5, imageUrl: 'https://via.placeholder.com/150', description: 'Cozy local spot' }];
+}
+
+// 7. Nearby Discovery System (Google Places + Cache + Multi-tier Fallback)
+exports.getNearbyPlaces = async (req, res) => {
+    const { getCityCoordinates } = require('../utils/locationResolver');
+    const { searchNearbyPlaces } = require('../services/googlePlacesService');
+    const NearbyPlaceCache = require('../models/NearbyPlaceCache');
+
+    try {
+        const { city, lat, lng, type = 'all', radius = 5000 } = req.query;
+        const normalizedType = ['restaurant', 'cafe', 'entertainment', 'dining', 'all'].includes(type) ? type : 'all';
+        const numRadius = parseInt(radius) || 5000;
+
+        // 1. Resolve Coordinates: Prioritize live lat/lng from request
+        let targetLat = parseFloat(lat);
+        let targetLng = parseFloat(lng);
+        let coordSource = "live_location";
+
+        if (isNaN(targetLat) || isNaN(targetLng)) {
+            const demoCoords = getCityCoordinates(city);
+            if (demoCoords) {
+                targetLat = demoCoords.lat;
+                targetLng = demoCoords.lng;
+                coordSource = `demo_city_fallback (${city})`;
+            } else {
+                targetLat = 30.0444; 
+                targetLng = 31.2357;
+                coordSource = "default_fallback (Cairo)";
+            }
+        }
+
+        console.log(`📍 Nearby Search - Center: [${targetLat}, ${targetLng}] | Source: ${coordSource} | Type: ${normalizedType} | Radius: ${numRadius}m`);
+
+        // 2. Cache Check (queryKey construction)
+        // Use rounded coordinates (3 decimal places ~= 110m precision) to avoid cache explosion
+        const roundedLat = targetLat.toFixed(3);
+        const roundedLng = targetLng.toFixed(3);
+        const queryKey = `${roundedLat}:${roundedLng}:${normalizedType}:${numRadius}`;
+
+        let cached = await NearbyPlaceCache.findOne({ queryKey });
+
+        if (cached && cached.expiresAt > new Date()) {
+            console.log(`💾 Cache HIT: ${queryKey}`);
+            return res.status(200).json({
+                success: true,
+                source: "cache",
+                count: cached.items.length,
+                items: cached.items
+            });
+        }
+
+        // 3. Live Google Places Fetch
+        try {
+            console.log(`💾 Cache MISS → fetching from API: ${queryKey}`);
+            let items = await searchNearbyPlaces({ 
+                lat: targetLat, 
+                lng: targetLng, 
+                radius: numRadius, 
+                type: normalizedType 
+            });
+
+            // 3.1 Calculate Distances & Enhanced Sorting (Rating DESC -> Distance ASC -> Price ASC)
+            items = items.map(item => {
+                if (item.location && item.location.latitude && item.location.longitude) {
+                    const dist = _calculateHaversineDistance(
+                        targetLat, targetLng, 
+                        item.location.latitude, item.location.longitude
+                    );
+                    return { ...item, distanceKm: parseFloat(dist.toFixed(2)), price: item.price || 150 };
+                }
+                return { ...item, distanceKm: null, price: item.price || 150 };
+            });
+
+            // Enhanced Sorting Logic
+            items.sort((a, b) => {
+                // 1. Rating DESC
+                if ((b.rating || 0) !== (a.rating || 0)) {
+                    return (b.rating || 0) - (a.rating || 0);
+                }
+                // 2. Distance ASC
+                if (a.distanceKm !== b.distanceKm) {
+                    if (a.distanceKm === null) return 1;
+                    if (b.distanceKm === null) return -1;
+                    return a.distanceKm - b.distanceKm;
+                }
+                // 3. Price ASC
+                return (a.price || 0) - (b.price || 0);
+            });
+
+            console.log(`📏 Calculated distance for ${items.length} places & sorted nearest-first.`);
+
+            // Update Cache (Save or Update)
+            const expiresAt = new Date();
+            expiresAt.setHours(expiresAt.getHours() + 24);
+
+            await NearbyPlaceCache.findOneAndUpdate(
+                { queryKey },
+                {
+                    queryKey,
+                    city: city || 'geolocation',
+                    category: normalizedType,
+                    center: { type: 'Point', coordinates: [targetLng, targetLat] },
+                    items: items,
+                    fetchedAt: new Date(),
+                    expiresAt: expiresAt
+                },
+                { upsert: true, new: true }
+            );
+
+            return res.status(200).json({
+                success: true,
+                source: "google_places",
+                count: items.length,
+                items: items
+            });
+
+        } catch (apiError) {
+            console.warn(`⚠️ External API Failure: ${apiError.message}. Attempting failover...`);
+            
+            // Failover Strategy 1: Stale Cache
+            if (cached) {
+                console.log("🔄 Failover: Returning stale cache data.");
+                return res.status(200).json({
+                    success: true,
+                    source: "stale_cache",
+                    count: cached.items.length,
+                    items: cached.items
+                });
+            }
+
+            // Failover Strategy 2: Curated Fallbacks
+            const status = apiError.response?.status || 500;
+            let reason = "Unknown failure";
+            if (status === 400) reason = "Invalid request / unsupported type";
+            else if (status === 403) reason = "Permission/auth issue";
+            else if (status === 503) reason = "Provider unavailable";
+
+            console.log(`⚠️ External API ${status} (${reason}) → fallback triggered for ${city || 'current location'}`);
+            const fallbackResults = _getCuratedNearbyFallback(city, normalizedType);
+            return res.status(200).json({
+                success: true,
+                source: "curated_fallback",
+                count: fallbackResults.length,
+                items: fallbackResults
+            });
+        }
+
+    } catch (err) {
+        console.error("🔥 Nearby Places CRASH:", err.message);
+        res.status(500).json({ success: false, error: err.message });
+    }
+};
+
+/**
+ * 🏗️ Curated Type-Aware Fallbacks
+ */
+function _getCuratedNearbyFallback(city = 'Cairo', type = 'all') {
+    const cityName = city?.toLowerCase() || 'cairo';
+    
+    // Fallback Data Store
+    const fallbacks = {
+        cairo: {
+            restaurant: [
+                { name: "Koshary Abou Tarek", address: "Champollion Rd, Cairo", rating: 4.8, category: "restaurant", imageUrl: "https://images.unsplash.com/photo-1517248135467-4c7edcad34c4" },
+                { name: "Naguib Mahfouz Cafe", address: "Khan el-Khalili, Cairo", rating: 4.6, category: "restaurant", imageUrl: "https://images.unsplash.com/photo-1544124499-58912cbddaad" }
+            ],
+            entertainment: [
+                { name: "Great Pyramids of Giza", address: "Al Haram, Giza", rating: 4.9, category: "attraction", imageUrl: "https://images.unsplash.com/photo-1503177119275-0aa32b3a9368" },
+                { name: "Egyptian Museum", address: "Tahrir Square, Cairo", rating: 4.7, category: "museum", imageUrl: "https://images.unsplash.com/photo-1518998053574-53ee81eb6449" }
+            ]
+        },
+        alexandria: {
+            restaurant: [
+                { name: "Fish Market", address: "Corniche, Alexandria", rating: 4.7, category: "restaurant", imageUrl: "https://images.unsplash.com/photo-1519708227418-c8fd9a32b7a2" }
+            ],
+            entertainment: [
+                { name: "Bibliotheca Alexandrina", address: "Corniche, Alex", rating: 4.9, category: "museum", imageUrl: "https://images.unsplash.com/photo-1566073771259-6a8506099945" },
+                { name: "Citadel of Qaitbay", address: "Eastern Harbor, Alex", rating: 4.7, category: "attraction", imageUrl: "https://images.unsplash.com/photo-1571896349842-33c89424de2d" }
+            ]
+        },
+        dubai: {
+            restaurant: [
+                { name: "Al Baik", address: "Dubai Mall", rating: 4.8, category: "restaurant", imageUrl: "https://images.unsplash.com/photo-1582281227059-591b4070073c" }
+            ],
+            entertainment: [
+                { name: "Burj Khalifa", address: "Downtown Dubai", rating: 4.9, category: "attraction", imageUrl: "https://images.unsplash.com/photo-1486406146926-c627a92ad1ab" },
+                { name: "Museum of the Future", address: "Sheikh Zayed Rd, Dubai", rating: 4.9, category: "museum", imageUrl: "https://images.unsplash.com/photo-1582650625119-3a31f8fa26ec" }
+            ]
+        }
+    };
+
+    const targetCity = fallbacks[cityName] || fallbacks.cairo;
+    
+    if (type === 'restaurant') return targetCity.restaurant;
+    if (type === 'entertainment') return targetCity.entertainment;
+    return [...targetCity.restaurant, ...targetCity.entertainment];
+}
+
+/**
+ * 📏 Geographic distance formula (Haversine)
+ */
+function _calculateHaversineDistance(lat1, lon1, lat2, lon2) {
+    const R = 6371; // Radius of the earth in km
+    const dLat = (lat2 - lat1) * Math.PI / 180;
+    const dLon = (lon2 - lon1) * Math.PI / 180;
+    const a = 
+        Math.sin(dLat/2) * Math.sin(dLat/2) +
+        Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * 
+        Math.sin(dLon/2) * Math.sin(dLon/2);
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+    return R * c; // Distance in km
+}
+
+exports.getNearbyHotels = async (req, res) => {
+    try {
+        const { lat, lng, city = "Cairo" } = req.query;
+        let hotels = [];
+        
+        // 1. Try RapidAPI search by location if lat/lng present
+        if (lat && lng) {
+            try {
+                const options = {
+                    method: 'GET',
+                    url: 'https://apidojo-booking-v1.p.rapidapi.com/properties/v2/list-by-lat-lng',
+                    params: {
+                        latitude: lat,
+                        longitude: lng,
+                        arrival_date: '2026-08-15',
+                        departure_date: '2026-08-20',
+                        guest_qty: '1',
+                        room_qty: '1',
+                        sort_by: 'popularity',
+                        units: 'metric',
+                        locale: 'en_gb'
+                    },
+                    headers: {
+                        'x-rapidapi-key': process.env.RAPIDAPI_KEY || '931526fb46msh984a7bdb7ab2e90p14f6b6jsn84db4c6f3237',
+                        'x-rapidapi-host': 'apidojo-booking-v1.p.rapidapi.com'
+                    }
+                };
+                const response = await axios.request(options);
+                const rawData = response.data?.result || response.data?.data?.results || [];
+                hotels = rawData.map(h => ({
+                    hotelId: (h.hotel_id || h.id || crypto.randomUUID()).toString(),
+                    hotelName: h.hotel_name || h.name || 'Unknown Hotel',
+                    mainPhotoUrl: h.main_photo_url || h.image_url,
+                    address: h.address || 'Nearby Location',
+                    price: h.price || h.min_total_price || 1200,
+                    currency: 'EGP',
+                    rating: h.review_score || 4.5,
+                    reviewCount: h.review_nr || 0,
+                    distance: h.distance ? parseFloat(h.distance).toFixed(1) : "0.5"
+                }));
+            } catch (apiErr) {
+                console.warn("⚠️ Nearby Hotels RapidAPI failed, falling back to city hotels");
+            }
+        }
+
+        // 2. Fallback to regular getHotels logic (city based)
+        if (hotels.length === 0) {
+            req.query.cityId = city === 'Alexandria' ? '-3712078' : '-3712125';
+            return exports.getHotels(req, res);
+        }
+
+        res.status(200).json({ success: true, source: 'rapidapi_nearby', data: hotels });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
+};
+
+const _arabicCityMap = {
+    'الغردقة':       'Hurghada',
+    'القاهرة':       'Cairo',
+    'الاسكندرية':    'Alexandria',
+    'الإسكندرية':    'Alexandria',
+    'الاسكندريه':    'Alexandria',
+    'شرم الشيخ':     'Sharm El-Sheikh',
+    'شرم':           'Sharm El-Sheikh',
+    'الأقصر':        'Luxor',
+    'الاقصر':        'Luxor',
+    'أسوان':         'Aswan',
+    'اسوان':         'Aswan',
+    'دهب':           'Dahab',
+    'الفيوم':        'Fayoum',
+    'دبي':           'Dubai',
+};
+
+const priceLevelMap = {
+  'PRICE_LEVEL_FREE': 0,
+  'PRICE_LEVEL_INEXPENSIVE': 500,
+  'PRICE_LEVEL_MODERATE': 1200,
+  'PRICE_LEVEL_EXPENSIVE': 2500,
+  'PRICE_LEVEL_VERY_EXPENSIVE': 5000,
+};
+
+exports.getHotelsByCity = async (req, res) => {
+    try {
+        const rawCity = req.query.city;
+        if (!rawCity) return res.status(400).json({ success: false, message: "city query parameter is required" });
+
+        const city = _arabicCityMap[rawCity.trim()] || rawCity.trim();
+        const queryKey = `hotels_city_${city.toLowerCase()}`;
+
+        // Check Cache First
+        const cached = await NearbyPlaceCache.findOne({ queryKey });
+        if (cached && cached.items && cached.items.length > 0) {
+            console.log(`[Google Hotels] Cache hit for ${city}`);
+            return res.status(200).json({ success: true, source: 'cache', data: cached.items });
+        }
+
+        console.log(`[Google Hotels] Geocoding ${city}...`);
+        const geoUrl = `https://maps.googleapis.com/maps/api/geocode/json?address=${encodeURIComponent(city)}&key=${process.env.GOOGLE_MAPS_API_KEY}`;
+        const geoRes = await axios.get(geoUrl);
+        
+        if (!geoRes.data.results || geoRes.data.results.length === 0) {
+            console.warn(`[Google Hotels] Geocoding failed for ${city}`);
+            // Fallback to regular getHotels logic
+            return exports.getHotels(req, res);
+        }
+
+        const { lat, lng } = geoRes.data.results[0].geometry.location;
+
+        console.log(`[Google Hotels] Fetching nearby hotels for ${city} at ${lat}, ${lng}...`);
+        const placesUrl = 'https://places.googleapis.com/v1/places:searchNearby';
+        const headers = {
+            'X-Goog-Api-Key': process.env.GOOGLE_MAPS_API_KEY,
+            'X-Goog-FieldMask': 'places.displayName,places.location,places.rating,places.priceLevel,places.photos,places.formattedAddress,places.id',
+            'Content-Type': 'application/json'
+        };
+        const body = {
+            includedTypes: ['lodging'],
+            locationRestriction: {
+                circle: {
+                    center: { latitude: lat, longitude: lng },
+                    radius: 5000
+                }
+            },
+            maxResultCount: 20
+        };
+
+        const placesRes = await axios.post(placesUrl, body, { headers });
+        const rawPlaces = placesRes.data.places || [];
+
+        if (rawPlaces.length === 0) {
+            console.warn(`[Google Hotels] No hotels found for ${city}`);
+            return exports.getHotels(req, res);
+        }
+
+        const hotels = rawPlaces.map(p => {
+            let imageUrl = null;
+            if (p.photos && p.photos.length > 0) {
+                const photoReference = p.photos[0].name;
+                imageUrl = `https://places.googleapis.com/v1/${photoReference}/media?maxHeightPx=400&maxWidthPx=400&key=${process.env.GOOGLE_MAPS_API_KEY}`;
+            }
+
+            return {
+                hotelId: p.id,
+                hotelName: p.displayName?.text || 'Unknown Hotel',
+                rating: p.rating || 4.0,
+                reviewScore: p.rating || 4.0,
+                price: priceLevelMap[p.priceLevel] || 1500,
+                currency: 'EGP',
+                mainPhotoUrl: imageUrl,
+                image: imageUrl,
+                address: p.formattedAddress || city,
+                latitude: p.location?.latitude,
+                longitude: p.location?.longitude,
+                city: city,
+                source: 'google_places'
+            };
+        });
+
+        // Save to cache (TTL: 30 mins)
+        await NearbyPlaceCache.findOneAndUpdate(
+            { queryKey },
+            {
+                queryKey,
+                city,
+                category: 'hotels',
+                center: { type: 'Point', coordinates: [lng, lat] },
+                items: hotels,
+                expiresAt: new Date(Date.now() + 30 * 60 * 1000)
+            },
+            { upsert: true, returnDocument: 'after' }
+        );
+
+        return res.status(200).json({ success: true, source: 'google_places', data: hotels });
+
+    } catch (err) {
+        console.error("[Google Hotels] Error:", err.message);
+        // Fallback gracefully
+        return exports.getHotels(req, res);
+    }
+};
+
+module.exports = exports;

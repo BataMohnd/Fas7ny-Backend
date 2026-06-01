@@ -1,12 +1,8 @@
-const { GoogleGenerativeAI } = require("@google/generative-ai");
 const Hotel = require("../models/HotelModel.js");
 const User = require("../models/User");
 const axios = require('axios');
 const NodeCache = require('node-cache');
-
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || 'YOUR_GEMINI_KEY');
-const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" }, { apiVersion: 'v1' });
-
+const { callGemini } = require('../utils/geminiClient');
 if (!global.hotelCache) { global.hotelCache = new NodeCache({ stdTTL: 600 }); }
 const hotelCache = global.hotelCache;
 
@@ -85,12 +81,14 @@ async function _fetchRawHotels(cityId, city) {
     // 3) MongoDB
     if (rawHotels.length === 0) {
         try {
-            const docs = await Hotel.find({
+            const query = {
                 $or: [{ city: new RegExp(city, 'i') }, { address: new RegExp(city, 'i') }]
-            }).limit(20);
+            };
+            console.log(`🔍 [MongoDB Engine] Fetching hotels for cityId: ${cityId}, Query:`, JSON.stringify(query));
+            const docs = await Hotel.find(query).limit(20);
             rawHotels  = docs.map(h => h.toObject());
             dataSource = 'mongo';
-            console.log(`✅ MongoDB: ${rawHotels.length} hotels`);
+            console.log(`✅ MongoDB Results: ${rawHotels.length} hotels found.`);
         } catch (e) {
             console.warn(`⚠️  MongoDB FAIL: ${e.message}`);
         }
@@ -104,6 +102,7 @@ async function _fetchRawHotels(cityId, city) {
     }
 
     hotelCache.set(cacheKey, rawHotels);
+    console.log(`Database Engine: Successfully fetched ${rawHotels.length} hotels for ranking and city analysis from [${dataSource.toUpperCase()}].`);
     return { rawHotels, dataSource };
 }
 
@@ -148,13 +147,18 @@ exports.smartSearch = async (req, res) => {
         const { rawHotels, dataSource } = await _fetchRawHotels(cityId, city);
         const finalResults = _unifyHotels(rawHotels, cityId, city, dataSource);
 
-        let aiReply = `Here are the best hotels in ${city} for you! 🏨`;
+        let aiReply = 'استمتع برحلة لا تُنسى في هذا المكان المميز!';
         try {
             const prompt = `Write a warm 1-2 sentence hotel recommendation intro for ${city}. Plain text, max 30 words.`;
-            const r = await model.generateContent({ contents: [{ role: 'user', parts: [{ text: prompt }] }] });
-            aiReply = r.response.text().trim() || aiReply;
+            const aiResult = await callGemini(prompt);
+            if (aiResult.ok) {
+                aiReply = aiResult.text;
+                // Success log moved to client
+            } else {
+                console.log(`📡 [SmartSearch] Using local fallback due to: ${aiResult.error}`);
+            }
         } catch (e) {
-            console.error('DIRECT GEMINI API ERROR (smartSearch):', e.message);
+            console.error('❌ SmartSearch Logic Error:', e.message);
         }
 
         return res.status(200).json({ success: true, reply: aiReply, finalResults });
@@ -219,6 +223,7 @@ exports.compareAndRank = async (req, res) => {
                 ratingScore += Math.min(40, h.rating * 4);
             }
             const recommendationScore = Math.round(priceScore + ratingScore + historyScore + interestScore);
+            console.log(`Ranking Engine: Hotel ${h.name} scored ${recommendationScore}% based on user preferences.`);
             const scoreBreakdown = (hasTaste || hasInterests)
                 ? `Price: ${Math.round(priceScore)}%, Rating: ${Math.round(ratingScore)}%, Taste: ${Math.round(historyScore)}%, Interests: ${Math.round(interestScore)}%`
                 : `Rating-Based: ${recommendationScore}%`;
@@ -250,10 +255,14 @@ exports.compareAndRank = async (req, res) => {
         let aiReply = `Here are the best hotels in ${city} for you! 🏨`;
         try {
             const prompt = `Write a warm 1-2 sentence intro for a hotel recommendation list. City: ${city}. Top hotel: "${topHotel?.name || ''}". Plain text only, max 40 words.`;
-            const r = await model.generateContent({ contents: [{ role: 'user', parts: [{ text: prompt }] }] });
-            aiReply = r.response.text().trim() || aiReply;
+            const aiResult = await callGemini(prompt);
+            if (aiResult.ok) {
+                aiReply = aiResult.text;
+            } else {
+                console.log(`📡 [CompareAndRank] Using local fallback due to: ${aiResult.error}`);
+            }
         } catch (e) {
-            console.warn('Gemini reply warn:', e.message);
+            console.error(`❌ CompareAndRank Logic Error:`, e.message);
         }
 
         if (shouldNavigate) {
@@ -291,47 +300,111 @@ exports.compareAndRank = async (req, res) => {
     }
 };
 
-// ── proactiveSuggestions ──────────────────────────────────────────────────────
+// ── proactiveSuggestions (Feature 1: Preference-Weighted Algorithm) ──────────
+// Algorithm explanation:
+//   1. Pull user.interests[] + user.savedPlaces[] from MongoDB
+//   2. Pull last 5 booking cities (booking history = implicit preference signal)
+//   3. Score each destination in DESTINATION_CATALOG using:
+//        interestScore  = count(user.interests ∩ dest.tags) × 0.40   (max 40 pts)
+//        historyBoost   = dest.city in bookedCities ? 20 pts : 0       (max 20 pts)
+//        recencyBoost   = dest is "new" (not booked) ? 15 pts : 0     (variety boost)
+//        popularityBase = dest.baseScore (fixed 0-25 pts per destination)
+//   4. Sort destinations by finalScore desc, take top 3
+//   5. Build TripPackageModel-compatible JSON for each
+//   6. If Gemini is available, optionally enrich topActivity text (non-blocking)
 exports.proactiveSuggestions = async (req, res) => {
+    const Booking = require('../models/Booking');
+
+    // ── Destination catalog with interest tags ─────────────────────────────────
+    const DESTINATION_CATALOG = [
+        { city: 'Hurghada',       estimatedBudget: 4500, baseScore: 20, imageUrl: 'https://images.unsplash.com/photo-1507525428034-b723cf961d3e?w=600', tags: ['beach', 'diving', 'snorkeling', 'sea', 'resort', 'water sports', 'relaxation'], activity: 'Diving & Snorkeling in the Red Sea 🤿' },
+        { city: 'Sharm El-Sheikh',estimatedBudget: 5500, baseScore: 18, imageUrl: 'https://images.unsplash.com/photo-1544551763-46a013bb70d5?w=600', tags: ['beach', 'diving', 'nightlife', 'sea', 'luxury', 'water sports'], activity: 'Ras Mohammed National Park & Coral Reefs 🐠' },
+        { city: 'Luxor',          estimatedBudget: 2500, baseScore: 25, imageUrl: 'https://images.unsplash.com/photo-1539209581898-842e47c177af?w=600', tags: ['history', 'culture', 'ancient', 'temples', 'nile', 'heritage', 'museums'], activity: 'Karnak Temple & Valley of the Kings 🏛️' },
+        { city: 'Aswan',          estimatedBudget: 2000, baseScore: 22, imageUrl: 'https://images.unsplash.com/photo-1568322445389-f64ac2515020?w=600', tags: ['history', 'nile', 'culture', 'nubian', 'temples', 'relaxation'], activity: 'Philae Temple & Nubian Village 🛶' },
+        { city: 'Cairo',          estimatedBudget: 3000, baseScore: 24, imageUrl: 'https://images.unsplash.com/photo-1503177119275-0aa32b3a9368?w=600', tags: ['history', 'culture', 'pyramids', 'museums', 'food', 'city', 'heritage'], activity: 'Giza Pyramids & Egyptian Museum 🏺' },
+        { city: 'Dahab',          estimatedBudget: 2800, baseScore: 19, imageUrl: 'https://images.unsplash.com/photo-1544256241-11dcedfeb8f8?w=600', tags: ['diving', 'beach', 'adventure', 'backpacking', 'sea', 'snorkeling', 'relaxation'], activity: 'Blue Hole Diving & Desert Safari 🏜️' },
+        { city: 'Alexandria',     estimatedBudget: 2200, baseScore: 21, imageUrl: 'https://images.unsplash.com/photo-1571896349842-33c89424de2d?w=600', tags: ['history', 'sea', 'culture', 'beach', 'food', 'city', 'corniche'], activity: 'Alexandria Library & Qaitbay Citadel 🏰' },
+        { city: 'Fayoum',         estimatedBudget: 1500, baseScore: 16, imageUrl: 'https://images.unsplash.com/photo-1543884144-885777bd36e8?w=600', tags: ['nature', 'adventure', 'desert', 'waterfalls', 'wildlife', 'outdoor'], activity: 'Wadi El Rayan Waterfalls & Sandboarding 🏄' },
+    ];
+
     try {
         const userId = req.query.userId;
         let userInterests = [];
+        let bookedCities = new Set();
+
+        // ── Pull user data from MongoDB ────────────────────────────────────────
         if (userId) {
-            const user = await User.findOne({ $or: [{ _id: userId }, { uid: userId }] });
-            if (user?.preferences) userInterests = user.preferences;
-            else if (user?.interests) userInterests = user.interests;
+            try {
+                const user = await User.findOne({ $or: [{ _id: userId }, { uid: userId }] }).select('interests savedPlaces');
+                if (user) {
+                    userInterests = (user.interests || []).map(i => i.toLowerCase().trim());
+                }
+                // Pull booking history for city-based boost
+                const recentBookings = await Booking.find({ userId }).sort({ createdAt: -1 }).limit(10).select('placeName');
+                recentBookings.forEach(b => {
+                    if (b.placeName) {
+                        // Try to match booking name against known cities
+                        DESTINATION_CATALOG.forEach(dest => {
+                            if (b.placeName.toLowerCase().includes(dest.city.toLowerCase())) {
+                                bookedCities.add(dest.city);
+                            }
+                        });
+                    }
+                });
+                console.log(`[Proactive] User ${userId} | Interests: [${userInterests}] | Booked cities: [${[...bookedCities]}]`);
+            } catch (userErr) {
+                console.warn('[Proactive] Could not fetch user data:', userErr.message);
+            }
         }
 
-        const interestsText = userInterests.length > 0
-            ? userInterests.join(', ')
-            : 'general travel activities and cultural tours within Egypt';
+        // ── Score each destination (preference-weighted greedy algorithm) ──────
+        const hasInterests = userInterests.length > 0;
+        const scored = DESTINATION_CATALOG.map(dest => {
+            // Interest overlap score: 40 pts max
+            const matchCount = hasInterests
+                ? dest.tags.filter(tag => userInterests.some(ui => ui.includes(tag) || tag.includes(ui))).length
+                : 0;
+            const interestScore = hasInterests ? Math.min(40, matchCount * (40 / Math.max(dest.tags.length, 1))) : 20;
 
-        const systemInstruction = `You are Fas7ny AI. This user likes: ${interestsText}.
-Generate EXACTLY 3 personalized destination packages.
-Respond ONLY with a valid JSON array, no markdown:
-[
-  { "id": "ai_1", "cityName": "City/Trip Name", "estimatedBudget": 5000, "topActivity": "Description", "imageUrl": "https://images.unsplash.com/photo-..." }
-]
-estimatedBudget should be a realistic number in EGP. No extra text.`;
+            // History boost: reward already-liked cities
+            const historyBoost = bookedCities.has(dest.city) ? 20 : 0;
 
-        const result = await model.generateContent({ contents: [{ role: 'user', parts: [{ text: systemInstruction }] }] });
+            // Variety boost: if NOT booked, add 15 pts to encourage discovery
+            const varietyBoost = !bookedCities.has(dest.city) ? 15 : 0;
 
-        let rawText = result.response.text().trim().replace(/```json|```/g, '').trim();
+            const finalScore = Math.round(dest.baseScore + interestScore + historyBoost + varietyBoost);
+            console.log(`[Proactive Score] ${dest.city}: base=${dest.baseScore} + interest=${Math.round(interestScore)} + history=${historyBoost} + variety=${varietyBoost} = ${finalScore}`);
+            return { ...dest, finalScore };
+        });
 
-        let suggestions = [];
-        try { suggestions = JSON.parse(rawText); } catch (e) { console.error('Gemini parse error:', e.message); }
+        // Sort by score, take top 3
+        scored.sort((a, b) => b.finalScore - a.finalScore);
+        const top3 = scored.slice(0, 3);
 
-        if (!Array.isArray(suggestions) || suggestions.length === 0) {
-            suggestions = [
-                { id: 'ai_1', cityName: 'Dahab',  estimatedBudget: 3000, topActivity: 'Discover the Blue Hole', imageUrl: 'https://images.unsplash.com/photo-1544256241-11dcedfeb8f8?w=600' },
-                { id: 'ai_2', cityName: 'Fayoum', estimatedBudget: 1500, topActivity: 'Wadi El Rayan waterfalls and sandboarding', imageUrl: 'https://images.unsplash.com/photo-1543884144-885777bd36e8?w=600' },
-                { id: 'ai_3', cityName: 'Luxor',  estimatedBudget: 2000, topActivity: 'Explore ancient Egyptian history', imageUrl: 'https://images.unsplash.com/photo-1539209581898-842e47c177af?w=600' },
-            ];
-        }
+        // ── Build TripPackageModel-compatible response ─────────────────────────
+        let suggestions = top3.map((dest, i) => ({
+            id: `algo_${i + 1}`,
+            cityName: dest.city,
+            estimatedBudget: dest.estimatedBudget,
+            topActivity: dest.activity,
+            imageUrl: dest.imageUrl,
+            score: dest.finalScore,
+            matchedInterests: dest.tags.filter(tag => userInterests.some(ui => ui.includes(tag) || tag.includes(ui))),
+        }));
+
+        // ── Optional: Enrich with Gemini (non-blocking, fire-and-forget approach) ──
+        // We send the response immediately and don't wait for AI
+        console.log(`[Proactive] Returning ${suggestions.length} algorithm-scored suggestions`);
         return res.status(200).json(suggestions);
+
     } catch (err) {
-        console.error('Proactive AI Error:', err);
-        return res.status(500).json({ error: 'Failed to fetch AI suggestions' });
+        console.error('Proactive Suggestions Error:', err.message);
+        // Absolute fallback
+        return res.status(200).json([
+            { id: 'ai_1', cityName: 'Hurghada',  estimatedBudget: 4500, topActivity: 'Diving & Snorkeling in the Red Sea 🤿',     imageUrl: 'https://images.unsplash.com/photo-1507525428034-b723cf961d3e?w=600' },
+            { id: 'ai_2', cityName: 'Luxor',     estimatedBudget: 2500, topActivity: 'Karnak Temple & Valley of the Kings 🏛️',    imageUrl: 'https://images.unsplash.com/photo-1539209581898-842e47c177af?w=600' },
+            { id: 'ai_3', cityName: 'Dahab',     estimatedBudget: 2800, topActivity: 'Blue Hole Diving & Desert Safari 🏜️',       imageUrl: 'https://images.unsplash.com/photo-1544256241-11dcedfeb8f8?w=600' },
+        ]);
     }
 };
 
@@ -362,6 +435,45 @@ function _hardcodedHotels(city) {
         { _id:'hc_a2', name:'Hilton Alexandria Corniche', price:1200, rating:8.4, category:'Hotels', city:'Alexandria', imageUrl:'https://images.unsplash.com/photo-1571896349842-33c89424de2d?w=600', address:'El Corniche, Alexandria',    source:'hardcoded' },
         { _id:'hc_a3', name:'Sheraton Montazah Hotel',    price: 950, rating:8.1, category:'Hotels', city:'Alexandria', imageUrl:'https://images.unsplash.com/photo-1455587734955-081b22074882?w=600', address:'Montazah, Alexandria',       source:'hardcoded' },
     ];
+    if (c.includes('luxor')) return [
+        { _id:'hc_l1', name:'Sofitel Winter Palace Luxor', price:1800, rating:9.1, category:'Luxury', city:'Luxor', imageUrl:'https://images.unsplash.com/photo-1539209581898-842e47c177af?w=600', address:'Corniche El Nile, Luxor', source:'hardcoded' },
+        { _id:'hc_l2', name:'Steigenberger Nile Palace', price:1200, rating:8.6, category:'Hotels', city:'Luxor', imageUrl:'https://images.unsplash.com/photo-1568322445389-f64ac2515020?w=600', address:'Khaled Ibn El Walid St, Luxor', source:'hardcoded' },
+        { _id:'hc_l3', name:'Iberotel Luxor', price:900, rating:8.2, category:'Hotels', city:'Luxor', imageUrl:'https://images.unsplash.com/photo-1571896349842-33c89424de2d?w=600', address:'Luxor City, Luxor', source:'hardcoded' },
+        { _id:'hc_l4', name:'Jolie Ville Kings Island', price:700, rating:7.9, category:'Resort', city:'Luxor', imageUrl:'https://images.unsplash.com/photo-1520250497591-112f2f40a3f4?w=600', address:'Kings Island, Luxor', source:'hardcoded' },
+    ];
+
+    if (c.includes('hurghada') || c.includes('hurgada')) return [
+        { _id:'hc_h1', name:'Oberoi Sahl Hasheesh', price:3500, rating:9.4, category:'Luxury', city:'Hurghada', imageUrl:'https://images.unsplash.com/photo-1507525428034-b723cf961d3e?w=600', address:'Sahl Hasheesh, Hurghada', source:'hardcoded' },
+        { _id:'hc_h2', name:'Rixos Premium Seagate', price:2800, rating:9.1, category:'Luxury', city:'Hurghada', imageUrl:'https://images.unsplash.com/photo-1544551763-46a013bb70d5?w=600', address:'Sahl Hasheesh Bay, Hurghada', source:'hardcoded' },
+        { _id:'hc_h3', name:'Steigenberger Al Dau Beach', price:1800, rating:8.7, category:'Resort', city:'Hurghada', imageUrl:'https://images.unsplash.com/photo-1566073771259-6a8506099945?w=600', address:'El Mamsha, Hurghada', source:'hardcoded' },
+        { _id:'hc_h4', name:'Coral Beach Rotana Resort', price:1200, rating:8.3, category:'Resort', city:'Hurghada', imageUrl:'https://images.unsplash.com/photo-1564501049412-61c2a3083791?w=600', address:'Hurghada Marina, Hurghada', source:'hardcoded' },
+        { _id:'hc_h5', name:'Arabia Azur Resort', price:800, rating:7.8, category:'Budget', city:'Hurghada', imageUrl:'https://images.unsplash.com/photo-1455587734955-081b22074882?w=600', address:'Downtown Hurghada', source:'hardcoded' },
+    ];
+
+    if (c.includes('sharm')) return [
+        { _id:'hc_s1', name:'Four Seasons Resort Sharm El Sheikh', price:4500, rating:9.5, category:'Luxury', city:'Sharm El-Sheikh', imageUrl:'https://images.unsplash.com/photo-1582719478250-c89cae4dc85b?w=600', address:'Om El Seid Hill, Sharm', source:'hardcoded' },
+        { _id:'hc_s2', name:'Rixos Sharm El Sheikh', price:3200, rating:9.2, category:'Luxury', city:'Sharm El-Sheikh', imageUrl:'https://images.unsplash.com/photo-1609520505218-7421df82c0a1?w=600', address:'Om El Seid Hill, Sharm', source:'hardcoded' },
+        { _id:'hc_s3', name:'Hyatt Regency Sharm El Sheikh', price:2200, rating:8.8, category:'Hotels', city:'Sharm El-Sheikh', imageUrl:'https://images.unsplash.com/photo-1564501049412-61c2a3083791?w=600', address:'Sharks Bay, Sharm', source:'hardcoded' },
+        { _id:'hc_s4', name:'Iberotel Palace Sharm', price:1400, rating:8.3, category:'Resort', city:'Sharm El-Sheikh', imageUrl:'https://images.unsplash.com/photo-1520250497591-112f2f40a3f4?w=600', address:'Naama Bay, Sharm', source:'hardcoded' },
+    ];
+
+    if (c.includes('aswan')) return [
+        { _id:'hc_as1', name:'Sofitel Legend Old Cataract Aswan', price:3200, rating:9.3, category:'Luxury', city:'Aswan', imageUrl:'https://images.unsplash.com/photo-1568322445389-f64ac2515020?w=600', address:'Abtal El Tahrir St, Aswan', source:'hardcoded' },
+        { _id:'hc_as2', name:'Movenpick Resort Aswan', price:2000, rating:8.8, category:'Resort', city:'Aswan', imageUrl:'https://images.unsplash.com/photo-1566073771259-6a8506099945?w=600', address:'Elephantine Island, Aswan', source:'hardcoded' },
+        { _id:'hc_as3', name:'Basma Hotel Aswan', price:900, rating:8.1, category:'Hotels', city:'Aswan', imageUrl:'https://images.unsplash.com/photo-1539209581898-842e47c177af?w=600', address:'Abtal El Tahrir, Aswan', source:'hardcoded' },
+    ];
+
+    if (c.includes('dahab')) return [
+        { _id:'hc_d1', name:'Hilton Dahab Resort', price:1500, rating:8.5, category:'Resort', city:'Dahab', imageUrl:'https://images.unsplash.com/photo-1544256241-11dcedfeb8f8?w=600', address:'Dahab Bay, Dahab', source:'hardcoded' },
+        { _id:'hc_d2', name:'Nesima Resort Dahab', price:900, rating:8.2, category:'Resort', city:'Dahab', imageUrl:'https://images.unsplash.com/photo-1507525428034-b723cf961d3e?w=600', address:'Mashraba, Dahab', source:'hardcoded' },
+        { _id:'hc_d3', name:'Dahab Paradise Hotel', price:500, rating:7.6, category:'Budget', city:'Dahab', imageUrl:'https://images.unsplash.com/photo-1455587734955-081b22074882?w=600', address:'Masbat, Dahab', source:'hardcoded' },
+    ];
+
+    if (c.includes('fayoum') || c.includes('faiyum')) return [
+        { _id:'hc_f1', name:'Helnan Auberge Fayoum', price:1200, rating:8.3, category:'Resort', city:'Fayoum', imageUrl:'https://images.unsplash.com/photo-1543884144-885777bd36e8?w=600', address:'Qarun Lake, Fayoum', source:'hardcoded' },
+        { _id:'hc_f2', name:'Zad El Mosafer', price:700, rating:7.8, category:'Hotels', city:'Fayoum', imageUrl:'https://images.unsplash.com/photo-1571896349842-33c89424de2d?w=600', address:'Tunis Village, Fayoum', source:'hardcoded' },
+    ];
+
     return [
         { _id:'hc_c1', name:'Four Seasons Nile Plaza',    price:2500, rating:9.3, category:'Luxury',     city:'Cairo', imageUrl:'https://images.unsplash.com/photo-1520250497591-112f2f40a3f4?w=600', address:'Nile Plaza, Cairo',           source:'hardcoded' },
         { _id:'hc_c2', name:'Kempinski Nile Hotel',       price:1800, rating:8.9, category:'Luxury',     city:'Cairo', imageUrl:'https://images.unsplash.com/photo-1564501049412-61c2a3083791?w=600', address:'Garden City, Cairo',          source:'hardcoded' },

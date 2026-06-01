@@ -6,7 +6,8 @@ const cors = require('cors');
 
 const app = express();
 
-app.use(cors()); // Allow all origins for local/web testing
+// ── Middlewares ─────────────────────────────────────────────────────────────
+app.use(cors());
 app.use(express.json());
 
 // 🔠 Global UTF-8 Encoding for Emoji & Arabic support
@@ -15,49 +16,83 @@ app.use((req, res, next) => {
     next();
 });
 
+// ── Controllers & Routes Imports ───────────────────────────────────────────
 const paymentController = require('./controllers/paymentController');
 const aiRoutes = require('./routes/api/aiRoutes');
 const hotelRoutes = require('./routes/api/hotels');
 const userRoutes = require('./routes/userRoutes'); 
-
+const placeRoutes = require('./routes/placeRoutes');
+const entertainmentRoutes = require('./routes/entertainmentRoutes');
 const { currencyMiddleware } = require('./middleware/currencyMiddleware');
-const initCron = require('./services/cronService'); // Initialize background tasks
-
+const initCron = require('./services/cronService'); 
 
 app.use(currencyMiddleware);
 
+// ── Route Definitions ──────────────────────────────────────────────────────
+app.use('/api/places', placeRoutes);
+app.use('/api/entertainment', entertainmentRoutes);
 app.use('/api/ai', aiRoutes);
-
-app.post('/api/payment/initiate', paymentController.initiatePayment);
-
 app.use('/api/hotels', hotelRoutes);
 app.use('/api/users', userRoutes);
 app.use('/api/wallet', require('./routes/api/wallet'));
 app.use('/api/bookings', require('./routes/api/bookings'));
 app.use('/api/v2/trips', require('./routes/api/trips'));
+app.use('/api/ratings', require('./routes/api/ratings'));
+app.use('/api/notifications', require('./routes/api/notifications'));
+app.use('/api/chat', require('./routes/api/chat'));
 
+// ── Feature 4: Trip Quality Analysis ──────────────────────────────────
+const tripAnalysisController = require('./controllers/tripAnalysisController');
+app.get('/api/trips/analysis/:userId', tripAnalysisController.getTripAnalysis);
+app.get('/api/trips/comparison/:userId', tripAnalysisController.getPlaceComparison);
 
+app.post('/api/payment/initiate', paymentController.initiatePayment);
 
+// ── 🔧 DEBUG: Route Inspector (remove before production) ───────────────────
+// Visit GET http://192.168.1.69:5000/debug/routes to see ALL active routes
+app.get('/debug/routes', (req, res) => {
+    const routes = [];
+    app._router.stack.forEach((middleware) => {
+        if (middleware.route) {
+            // Direct routes on app
+            routes.push({
+                path: middleware.route.path,
+                methods: Object.keys(middleware.route.methods).join(', ').toUpperCase()
+            });
+        } else if (middleware.name === 'router' && middleware.handle.stack) {
+            // Routes inside sub-routers (express.Router)
+            middleware.handle.stack.forEach((handler) => {
+                if (handler.route) {
+                    const basePath = middleware.regexp.source
+                        .replace('\\/?(?=\\/|$)', '')
+                        .replace(/\\\//g, '/')
+                        .replace('^', '')
+                        .replace('?(?:/(?=$))?$', '');
+                    routes.push({
+                        path: basePath + handler.route.path,
+                        methods: Object.keys(handler.route.methods).join(', ').toUpperCase()
+                    });
+                }
+            });
+        }
+    });
+    res.json({ totalRoutes: routes.length, routes });
+});
+
+// ── Global Error Handler (catches any unhandled errors) ────────────────────
+app.use((err, req, res, next) => {
+    console.error(`🛑 [GLOBAL ERROR] ${req.method} ${req.url} >> ${err.message}`);
+    res.status(err.status || 500).json({
+        success: false,
+        message: 'An unexpected server error occurred.',
+        error: process.env.NODE_ENV === 'development' ? err.stack : undefined
+    });
+});
+
+// ── Database Connection & Lifecycle ──────────────────────────────────────────
 mongoose.connect(process.env.MONGO_URI)
   .then(() => {
     console.log("🍃 Connected to MongoDB Successfully [Database: fas7ny]");
-    
-    // 🔥 Final Data Purge for Fresh Start (Places & Hotels)
-    const Hotel = require('./models/HotelModel');
-    const Place = require('./models/Place');
-    Promise.all([
-        Hotel.deleteMany({}),
-        Place.deleteMany({})
-    ]).then(() => {
-        console.log("🔥 Database Purged (Places & Hotels) - Clean Slate for Multi-City Support.");
-    }).catch(err => console.error("❌ Purge Error:", err.message));
-    
-    const placeRoutes = require('./routes/placeRoutes');
-    app.use('/api/places', placeRoutes);
-    
-    const entertainmentRoutes = require('./routes/entertainmentRoutes');
-    app.use('/api/entertainment', entertainmentRoutes);
-    
     initCron(); // Start Auto-Archive Cron Job
   })
   .catch((err) => console.log("❌ MongoDB Connection Error: ", err));

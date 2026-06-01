@@ -1,5 +1,6 @@
 const axios = require('axios');
-const { GoogleGenerativeAI } = require('@google/generative-ai');
+const { callGemini } = require('../utils/geminiClient');
+const Place = require('../models/Place');
 
 const RAPID_API_KEY = process.env.RAPIDAPI_KEY || '931526fb46msh984a7bdb7ab2e90p14f6b6jsn84db4c6f3237';
 const RAPID_API_HOST = 'tripadvisor16.p.rapidapi.com';
@@ -12,8 +13,6 @@ const extractPlaceData = (place) => ({
     description: place?.description || place?.primaryInfo || "No description available",
     photo: place?.photo?.images?.large?.url || place?.thumbnail || place?.image || "https://via.placeholder.com/150"
 });
-
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
 exports.searchTrips = async (req, res) => {
     console.log(`📡 [Fas7ny AI] Handling Trip Search Request at 192.168.1.69:5000`);
@@ -83,39 +82,22 @@ exports.searchTrips = async (req, res) => {
             restaurants: restaurants.slice(0, 5)
         };
 
-        // 3. AI Integration via Google Gemini 1.5 Flash
+        // 3. AI Integration via Google Gemini 2.5 Flash
         let aiItinerary = "Marhaba! I'm Fas7ny AI. We couldn't build your custom plan right now, but definitely check out the top spots listed below! 🇪🇬✨";
 
         try {
             const systemInstruction = "You are 'Fas7ny AI', an expert Egyptian travel guide. Your goal is to build fun, compact 3-day plans for Egypt using data provided in JSON format.";
-            
-            // --- Bulletproof AI Configuration: Direct API Call (Bypassing SDK) ---
-            const apiKey = process.env.GEMINI_API_KEY;
-            const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key=${apiKey}`;
+            const prompt = `${systemInstruction}\n\nContext Data: ${JSON.stringify(promptData)}`;
 
-            console.log("📤 Sending DIRECT call to Gemini Flash Latest (v1beta)...");
-            const response = await axios.post(url, {
-                contents: [
-                    {
-                        role: "user",
-                        parts: [{ text: `Context: ${systemInstruction}` }]
-                    },
-                    {
-                        role: "model",
-                        parts: [{ text: "Understood! I am Fas7ny, your local travel guide. 🇪🇬✨" }]
-                    },
-                    {
-                        role: "user",
-                        parts: [{ text: prompt }]
-                    }
-                ]
-            });
-
-            aiItinerary = response.data.candidates[0].content.parts[0].text;
-            console.log("✅ Direct Gemini Response Success for Trips");
+            const aiResult = await callGemini(prompt);
+            if (aiResult.ok) {
+                aiItinerary = aiResult.text;
+                // Success log moved to client
+            } else {
+                console.log(`📡 [Trips] Using static fallback due to: ${aiResult.error}`);
+            }
         } catch (geminiErr) {
-            console.error("❌ DIRECT GEMINI API ERROR (Trips):", geminiErr.response ? geminiErr.err.response.data : geminiErr.message);
-            // Fallback already set above
+            console.error("❌ Trip Itinerary Logic Error:", geminiErr.message);
         }
 
         // 4. Generate Enhanced Mock Flights based on Origin -> Destination
@@ -146,5 +128,95 @@ exports.searchTrips = async (req, res) => {
     } catch (error) {
         console.error("❌ /api/v2/trips/search Error:", error);
         return res.status(500).json({ success: false, message: "Server Error during trip search" });
+    }
+};
+
+// ─── NEW: Smart Trip Planner using Greedy Algorithm ───
+exports.generateTripPlan = async (req, res) => {
+    try {
+        const { destination, days, totalBudget } = req.body;
+
+        if (!destination || !days || !totalBudget) {
+            return res.status(400).json({ success: false, message: "Missing required fields" });
+        }
+
+        const dailyBudget = totalBudget / days;
+
+        // Query MongoDB for places in the destination
+        const hotels = await Place.find({ city: new RegExp(destination, 'i'), category: 'hotel' }).sort({ price: 1 }).lean();
+        const activities = await Place.find({ city: new RegExp(destination, 'i'), category: { $ne: 'hotel' } }).sort({ price: 1 }).lean();
+
+        if (hotels.length === 0 || activities.length === 0) {
+            return res.status(404).json({ success: false, message: "Not enough places found in this destination to plan a trip." });
+        }
+
+        const itinerary = [];
+        let remainingBudget = totalBudget;
+
+        for (let i = 1; i <= days; i++) {
+            // Greedy approach: Pick the best fitting affordable hotel and 2 activities for the day
+            let dailySpent = 0;
+            let selectedHotel = null;
+            let selectedActivities = [];
+
+            // Find a hotel that fits within ~50% of the daily budget, or the cheapest available
+            selectedHotel = hotels.find(h => h.price <= (dailyBudget * 0.5)) || hotels[0];
+            dailySpent += selectedHotel.price;
+
+            // Pick 2 distinct activities
+            for (let j = 0; j < activities.length; j++) {
+                if (selectedActivities.length < 2 && (dailySpent + activities[j].price) <= dailyBudget) {
+                    selectedActivities.push(activities[j]);
+                    dailySpent += activities[j].price;
+                }
+            }
+
+            // Fallback: If we couldn't find 2 activities within budget, just take the cheapest ones
+            if (selectedActivities.length < 2) {
+                 const fallbackActivities = activities.slice(0, 2);
+                 fallbackActivities.forEach(a => {
+                     if(!selectedActivities.find(sa => sa._id === a._id)){
+                         selectedActivities.push(a);
+                         dailySpent += a.price;
+                     }
+                 });
+            }
+
+            remainingBudget -= dailySpent;
+
+            itinerary.push({
+                day: i,
+                hotel: selectedHotel,
+                activities: selectedActivities,
+                dailyCost: dailySpent
+            });
+        }
+
+        if (remainingBudget < 0) {
+            return res.status(200).json({
+                success: true,
+                warning: "Your budget is very tight or insufficient for this destination. Here is the cheapest possible itinerary.",
+                data: {
+                    destination,
+                    days,
+                    totalCost: totalBudget - remainingBudget,
+                    itinerary
+                }
+            });
+        }
+
+        return res.status(200).json({
+            success: true,
+            data: {
+                destination,
+                days,
+                totalCost: totalBudget - remainingBudget,
+                itinerary
+            }
+        });
+
+    } catch (error) {
+        console.error("❌ /api/trips/generate Error:", error);
+        return res.status(500).json({ success: false, message: "Server Error during trip generation" });
     }
 };

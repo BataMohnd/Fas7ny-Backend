@@ -1,196 +1,175 @@
-const { GoogleGenerativeAI } = require("@google/generative-ai");
 const axios = require("axios");
 const Place = require("../models/Place"); // Assume Place.js exports the Mongoose model
 const User = require("../models/User");
+const { callGemini } = require('../utils/geminiClient');
 
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" }, { apiVersion: 'v1' });
+// ── TSP Heuristic: Nearest Neighbor ───────────────────────────────────────────
+function optimizeRoute(startNode, locations) {
+    let unvisited = [...locations];
+    let current = startNode;
+    let route = [];
+
+    while (unvisited.length > 0) {
+        let closestIndex = 0;
+        let minDistance = Infinity;
+
+        for (let i = 0; i < unvisited.length; i++) {
+            let loc = unvisited[i];
+            let dLng = (loc.location?.coordinates[0] || loc.longitude) - current.lng;
+            let dLat = (loc.location?.coordinates[1] || loc.latitude) - current.lat;
+            let dist = Math.sqrt(dLng * dLng + dLat * dLat);
+
+            if (dist < minDistance) {
+                minDistance = dist;
+                closestIndex = i;
+            }
+        }
+        
+        let winner = unvisited.splice(closestIndex, 1)[0];
+        route.push(winner);
+        current = { 
+            lat: winner.location?.coordinates[1] || winner.latitude, 
+            lng: winner.location?.coordinates[0] || winner.longitude 
+        };
+    }
+    return route;
+}
+
+/**
+ * 📍 Ground Truth Coordinate Resolver
+ * Standardizes demo cities to prevent external geocoding failures.
+ */
+function getCityCoordinates(cityId) {
+    const cityMap = {
+        '-3712125': { name: "Cairo", lat: 30.0444, lng: 31.2357 },
+        '8': { name: "Dubai", lat: 25.2048, lng: 55.2708 },
+        '-3712078': { name: "Alexandria", lat: 31.2001, lng: 29.9187 },
+        '-3712073': { name: "Hurghada", lat: 27.2579, lng: 33.8116 },
+        '-3712071': { name: "Luxor", lat: 25.6872, lng: 32.6396 },
+        '-3712055': { name: "Sharm El-Sheikh", lat: 27.9158, lng: 34.3299 }
+    };
+    return cityMap[cityId];
+}
 
 exports.exploreEntertainment = async (req, res) => {
     try {
-        const { cityId, lat, lng, userId } = req.query;
+        const { cityId, lat, lng, userId, bookingId } = req.query;
 
-        // Coordinate Logic: Ensure lat/lng are parsed gracefully
+        // 1. Coordinate Resolution Logic via Ground Truth Resolver
         let numericLat = parseFloat(lat);
         let numericLng = parseFloat(lng);
-        let cityContext = "Cairo"; // Default
+        let cityContext = "Cairo";
 
-        // Apply Hybrid Logic: if lat/lng are invalid, use default mappings based on cityId
-        if (isNaN(numericLat) || isNaN(numericLng)) {
-            let cityMap = {
-                '-3712125': { name: "Cairo", lat: 30.0444, lng: 31.2357 },
-                '8': { name: "Dubai", lat: 25.2048, lng: 55.2708 },
-                '-3712078': { name: "Alexandria", lat: 31.2001, lng: 29.9187 },
-                '-3712073': { name: "Hurghada", lat: 27.2579, lng: 33.8116 },
-                '-3712071': { name: "Luxor", lat: 25.6872, lng: 32.6396 },
-                '-3712055': { name: "Sharm El-Sheikh", lat: 27.9158, lng: 34.3299 }
-            };
-            let mapped = cityMap[cityId] || cityMap['-3712125'];
-            numericLat = mapped.lat;
-            numericLng = mapped.lng;
-            cityContext = mapped.name;
-        } else {
-            // Find city context if possible
-            let cityMap = {
-                '-3712125': "Cairo", '8': "Dubai", '-3712078': "Alexandria",
-                '-3712073': "Hurghada", '-3712071': "Luxor", '-3712055': "Sharm El-Sheikh"
-            };
-            cityContext = cityMap[cityId] || "Cairo";
+        const verified = getCityCoordinates(cityId);
+        if (verified) {
+            // Force verified coordinates for demo-safety unless valid lat/lng provided (Ground Truth takes precedence for demo stability)
+            if (isNaN(numericLat) || isNaN(numericLng)) {
+                numericLat = verified.lat;
+                numericLng = verified.lng;
+                console.log(`📍 NN Logic: Using Verified Demo Coordinates for ${verified.name} [${numericLat}, ${numericLng}]`);
+            }
+            cityContext = verified.name;
         }
 
-        console.log(`\n🎟️ Exploring Entertainment in ${cityContext} | NN Center [${numericLat}, ${numericLng}]`);
+        const isBrowsing = !bookingId || bookingId === 'null';
+        const searchRadius = isBrowsing ? 5000 : 50000; 
 
-        // Categories mapping Context -> Query
-        let queryPrompt = `top tourist attractions, activities and entertainment in ${cityContext}`;
-        if (["Hurghada", "Sharm El-Sheikh", "Alexandria"].includes(cityContext)) {
-            queryPrompt = `top beaches, water sports, and activities in ${cityContext}`;
-        } else if (["Luxor", "Aswan"].includes(cityContext)) {
-            queryPrompt = `top historic temples and Nile cruises in ${cityContext}`;
-        }
+        console.log(`\n🎟️ Exploring Entertainment | Context: ${cityContext} | Radius: ${searchRadius}m`);
 
-        // STEP 1: $near MongoDB query (Radius 50km mostly since the city could be wide)
-        let localActivities = await Place.find({
+        let queryPrompt = `top tourist attractions and entertainment in ${cityContext}`;
+
+        // STEP 1: $near MongoDB query
+        const dbQuery = {
             location: {
                 $near: {
                     $geometry: {
                         type: "Point",
-                        coordinates: [numericLng, numericLat] // GeoJSON is [LNG, LAT]
+                        coordinates: [numericLng, numericLat]
                     },
-                    $maxDistance: 50000 // 50km
+                    $maxDistance: searchRadius
                 }
             },
             category: { $in: ['attraction', 'museum', 'activity', 'entertainment', 'beach', 'cruise', 'historical'] }
-        }).limit(10);
+        };
+        
+        let localActivities = await Place.find(dbQuery).limit(10);
+        console.log(`🔍 [MongoDB Engine] Fetched ${localActivities.length} activities for proximity analysis.`);
 
-        // Calculate manual distances if needed just for the log
-        let count = localActivities.length;
-        if (count > 0) {
-            console.log(`✅ MongoDB Cache Hit: Found ${count} activities nearby.`);
-            localActivities.forEach(p => {
-                let pLng = p.location?.coordinates[0] || p.longitude;
-                let pLat = p.location?.coordinates[1] || p.latitude;
-                // Basic Haversine approx for logging
-                let dx = pLng - numericLng;
-                let dy = pLat - numericLat;
-                let distApprox = Math.sqrt(dx*dx + dy*dy) * 111.32; // rough km conversion
-                console.log(`   📍 ${p.name.padEnd(25)} | Distance: ~${distApprox.toFixed(2)} km`);
-            });
-        }
-
-        // STEP 2: Scrape Fallback if < 5 activities found
-        if (count < 5 && process.env.SERPER_API_KEY) {
-            console.log(`⚠️ Insufficient Activities (${count}/5). Triggering Serper API for "${queryPrompt}"`);
-            
+        // STEP 2: External Provider (Serper) Fetch if MongoDB is empty
+        if (localActivities.length < 5 && process.env.SERPER_API_KEY) {
             try {
-                const serperRes = await axios.post('https://google.serper.dev/places', {
+                const serperUrl = 'https://google.serper.dev/places';
+                console.log(`📡 [Serper API] Requesting live data: POST ${serperUrl} | Query: "${queryPrompt}"`);
+                
+                const serperRes = await axios.post(serperUrl, {
                     q: queryPrompt,
                     location: `${numericLat},${numericLng}`
                 }, {
-                    headers: { 'X-API-KEY': process.env.SERPER_API_KEY, 'Content-Type': 'application/json' }
+                    headers: { 'X-API-KEY': process.env.SERPER_API_KEY, 'Content-Type': 'application/json' },
+                    timeout: 8000
                 });
+
+                console.log(`✅ [Serper API] Response: ${serperRes.status} OK`);
 
                 let rawPlaces = serperRes.data?.places || [];
-                let newPlaces = rawPlaces.map(p => {
-                    let cat = p.category ? p.category.toLowerCase() : "attraction";
-                    if(cat.includes("museum") || cat.includes("history")) cat = "historical";
-                    else if(cat.includes("beach") || cat.includes("sea")) cat = "beach";
-                    else cat = "attraction";
-
-                    return {
-                        name: p.title || p.name || "Exciting Spot",
-                        description: p.address || "",
-                        price: 300, // mock base price
-                        neighbourhood: cityContext,
-                        imageUrl: p.imageUrl || "https://images.unsplash.com/photo-1544256241-11dcedfeb8f8",
-                        category: cat,
-                        rating: p.rating || 4.5,
-                        numberOfReviews: p.ratingCount || Math.floor(Math.random() * 500) + 50,
-                        latitude: p.latitude || numericLat,
-                        longitude: p.longitude || numericLng,
-                        location: {
-                            type: "Point",
-                            coordinates: [p.longitude || numericLng, p.latitude || numericLat]
-                        }
-                    };
-                });
+                let newPlaces = rawPlaces.map(p => ({
+                    name: p.title || p.name || "Exciting Spot",
+                    description: p.address || "",
+                    price: 300,
+                    neighbourhood: cityContext,
+                    imageUrl: p.imageUrl || "https://images.unsplash.com/photo-1544256241-11dcedfeb8f8",
+                    category: "attraction",
+                    rating: p.rating || 4.5,
+                    numberOfReviews: p.ratingCount || 100,
+                    latitude: p.latitude || numericLat,
+                    longitude: p.longitude || numericLng,
+                    location: {
+                        type: "Point",
+                        coordinates: [p.longitude || numericLng, p.latitude || numericLat]
+                    }
+                }));
 
                 if (newPlaces.length > 0) {
                     try {
                         const inserted = await Place.insertMany(newPlaces, { ordered: false });
                         localActivities.push(...inserted);
-                        console.log(`✅ Serper Success: Synced ${newPlaces.length} real locations into MongoDB.`);
-                    } catch (err) {
-                       console.warn("DB Insert Warn:", err.message);
-                    }
+                    } catch (err) { console.warn("DB Cache Insert Warn:", err.message); }
                 }
-            } catch (e) {
-                if (e.response && e.response.status === 403) {
-                    console.error(`⚠️ Check Serper Key: Forbidden (403). Using Multi-City Fallback for ${cityContext}.`);
-                    
-                    let fallbackSpots = [];
-                    if (cityContext === "Alexandria") {
-                        fallbackSpots = [
-                            { name: "Bibliotheca Alexandrina", description: "A major library and cultural center on the shore of the Mediterranean.", lat: 31.2089, lng: 29.9092, cat: "historical", img: "https://images.unsplash.com/photo-1568292342316-60aa3d36f4b3" },
-                            { name: "Citadel of Qaitbay", description: "A 15th-century defensive fortress on the Mediterranean coast.", lat: 31.2140, lng: 29.8850, cat: "historical", img: "https://images.unsplash.com/photo-1599833454130-19277d70054a" },
-                            { name: "Stanly Bridge", description: "An iconic bridge offering stunning views of the Mediterranean Sea.", lat: 31.2355, lng: 29.9480, cat: "entertainment", img: "https://images.unsplash.com/photo-1568292342316-60aa3d36f4b3" },
-                            { name: "Montaza Palace", description: "Lush gardens and palaces overlooking the sea.", lat: 31.2872, lng: 30.0161, cat: "attraction", img: "https://images.unsplash.com/photo-1599833454130-19277d70054a" }
-                        ];
-                    } else {
-                        // Default to Cairo Fallback
-                        fallbackSpots = [
-                            { name: "The Egyptian Museum", description: "Home to the largest collection of ancient Egyptian relics.", lat: 30.0478, lng: 31.2336, cat: "historical", img: "https://images.unsplash.com/photo-1572252009286-268acec5ca0a" },
-                            { name: "Khan el-Khalili", description: "A famous bazaar and souq in the historic center of Cairo.", lat: 30.0477, lng: 31.2622, cat: "entertainment", img: "https://images.unsplash.com/photo-1544971587-b842c27f8e14" },
-                            { name: "Al-Azhar Park", description: "Lush gardens with panoramic views of Cairo's skyline.", lat: 30.0406, lng: 31.2652, cat: "attraction", img: "https://images.unsplash.com/photo-1542314831-068cd1dbfeeb" },
-                            { name: "Cairo Tower", description: "Iconic tower offering 360-degree views of the city.", lat: 30.0459, lng: 31.2243, cat: "entertainment", img: "https://images.unsplash.com/photo-1544256241-11dcedfeb8f8" }
-                        ];
-                    }
-                    
-                    const dynamicFallback = fallbackSpots.map(s => ({
-                        name: s.name, description: s.description, price: 300, neighbourhood: cityContext,
-                        imageUrl: s.img, category: s.cat, rating: 4.8, numberOfReviews: 1200,
-                        latitude: s.lat, longitude: s.lng,
-                        location: { type: "Point", coordinates: [s.lng, s.lat] }
-                    }));
-                    localActivities.push(...dynamicFallback);
-                } else {
-                    console.warn(`Serper fallback failed: ${e.message}`);
+            } catch (e) { 
+                const status = e.response?.status;
+                console.error(`❌ [Serper API] External Provider Error: [Status ${status}] | URL: https://google.serper.dev/places`);
+                if (status === 403) {
+                    console.warn(`⚠️ Auth Failure (403): Triggering [${cityContext}] curated fallback layer.`);
                 }
             }
         }
 
-        // Ensure we filter out duplicates if we concatenated array, but usually reloading from DB is safer.
-        // For speed, since this is a demo, we'll just remove duplicates by name locally.
-        const uniqueActivitiesMap = new Map();
-        localActivities.forEach(act => uniqueActivitiesMap.set(act.name, act));
-        const finalActivities = Array.from(uniqueActivitiesMap.values()).slice(0, 15);
+        // DEDUPLICATION
+        const uniqueMap = new Map();
+        localActivities.forEach(act => uniqueMap.set(act.name, act));
+        let processedActivities = Array.from(uniqueMap.values());
 
-        // STEP 3: Gemini Insight
-        let insight = "Explore top attractions around you and dive into unforgettable local adventures!";
-        if (finalActivities.length > 0) {
-            let topSpot = finalActivities[0].name;
-            try {
-                let userInterests = "travel";
-                if (userId) {
-                    const user = await User.findOne({ $or: [{ _id: userId }, { uid: userId }] });
-                    if (user && user.preferences?.length > 0) userInterests = user.preferences.join(", ");
-                }
+        // TSP Optimization
+        let optimizedActivities = optimizeRoute({ lat: numericLat, lng: numericLng }, processedActivities);
 
-                const prompt = `Write a punchy, conversational travel tip in exactly 1-2 short sentences (max 20 words).
-User interests: ${userInterests}. Top activity nearby: "${topSpot}".
-Example format: "Since you love History, ${topSpot} is only a few minutes away!"`;
-
-                const result = await model.generateContent({ contents: [{ role: 'user', parts: [{ text: prompt }] }] });
-                insight = result.response.text().trim().replace(/"/g, ''); // remove extra quotes
-            } catch (e) {
-                console.warn("Gemini Insight failed:", e.message);
-                insight = `Since you're nearby, ${topSpot} is highly recommended to check out today!`;
-            }
+        // Curated Fallback layer if still empty or failed
+        if (optimizedActivities.length === 0) {
+            console.log(`⛒️  Applying Curated Hardcoded Fallback for ${cityContext}.`);
+            optimizedActivities = _getCuratedActivities(cityContext);
         }
+
+        // Gemini Insight
+        let insight = `Since you're nearby, ${optimizedActivities[0]?.name || 'the area'} is highly recommended!`;
+        try {
+            const prompt = `Write a punchy travel tip (max 20 words) for a user near ${optimizedActivities[0]?.name}. Arabic language.`;
+            const aiResult = await callGemini(prompt);
+            if (aiResult.ok) insight = aiResult.text;
+        } catch (e) { console.error("Insight fallback triggered."); }
 
         return res.status(200).json({
             success: true,
             insight: insight,
-            data: finalActivities
+            data: optimizedActivities.slice(0, 15)
         });
 
     } catch (error) {
@@ -198,3 +177,30 @@ Example format: "Since you love History, ${topSpot} is only a few minutes away!"
         res.status(500).json({ success: false, error: "Failed to fetch activities" });
     }
 };
+
+/**
+ * 🏗️ Curated Demo-Ready Fallbacks
+ */
+function _getCuratedActivities(city) {
+    const c = city.toLowerCase();
+    if (c.includes('cairo')) return [
+        { name: 'Great Pyramids of Giza', category: 'historical', rating: 4.9, imageUrl: 'https://images.unsplash.com/photo-1503177119275-0aa32b3a9368', neighbourhood: 'Giza Plateau' },
+        { name: 'Egyptian Museum', category: 'museum', rating: 4.8, imageUrl: 'https://images.unsplash.com/photo-1544256241-11dcedfeb8f8', neighbourhood: 'Tahrir' },
+        { name: 'Khan el-Khalili', category: 'attraction', rating: 4.7, imageUrl: 'https://images.unsplash.com/photo-1553913861-c0fddf2619ee', neighbourhood: 'Old Cairo' },
+        { name: 'Cairo Tower', category: 'entertainment', rating: 4.6, imageUrl: 'https://images.unsplash.com/photo-1539209581898-842e47c177af', neighbourhood: 'Zamalek' }
+    ];
+    if (c.includes('alex')) return [
+        { name: 'Bibliotheca Alexandrina', category: 'museum', rating: 4.9, imageUrl: 'https://images.unsplash.com/photo-1566073771259-6a8506099945', neighbourhood: 'Corniche' },
+        { name: 'Qaitbay Citadel', category: 'historical', rating: 4.7, imageUrl: 'https://images.unsplash.com/photo-1571896349842-33c89424de2d', neighbourhood: 'Eastern Harbor' },
+        { name: 'Stanley Bridge', category: 'attraction', rating: 4.6, imageUrl: 'https://images.unsplash.com/photo-1506461883276-594a12b11cf3', neighbourhood: 'Stanley' },
+        { name: 'Montaza Palace Gardens', category: 'entertainment', rating: 4.8, imageUrl: 'https://images.unsplash.com/photo-1551221398-33318991461f', neighbourhood: 'Montaza' }
+    ];
+    if (c.includes('dubai')) return [
+        { name: 'Burj Khalifa', category: 'entertainment', rating: 4.9, imageUrl: 'https://images.unsplash.com/photo-1486406146926-c627a92ad1ab', neighbourhood: 'Downtown' },
+        { name: 'Dubai Mall', category: 'attraction', rating: 4.8, imageUrl: 'https://images.unsplash.com/photo-1512453979798-5ea266f8880c', neighbourhood: 'Downtown' },
+        { name: 'Museum of the Future', category: 'museum', rating: 4.9, imageUrl: 'https://images.unsplash.com/photo-1582650625119-3a31f8fa26ec', neighbourhood: 'Sheikh Zayed Rd' }
+    ];
+    return [
+        { name: 'Local Historical Tour', category: 'historical', rating: 4.5, imageUrl: 'https://via.placeholder.com/150', neighbourhood: city }
+    ];
+}

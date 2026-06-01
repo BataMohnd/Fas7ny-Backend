@@ -11,4 +11,9 @@ router.post('/sync', userController.syncUser);
 router.post('/forgot-password', userController.forgotPassword);
 router.post('/reset-password', userController.resetPassword);
 
+// ── Feature 3: Saved Places (mirrors Firestore favorites in MongoDB) ──────────
+router.post('/:userId/saved',             userController.addSavedPlace);
+router.delete('/:userId/saved/:placeId',  userController.removeSavedPlace);
+router.get('/:userId/saved',              userController.getSavedPlaces);
+
 module.exports = router;

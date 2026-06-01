@@ -16,7 +16,8 @@ const hotelSchema = new mongoose.Schema({
   longitude: { type: Number },
   description: { type: String },
   room_type: { type: String, default: "" }, // Added for search
-  category: { type: String, default: 'Hotels' }
+  category: { type: String, default: 'Hotels' },
+  sentimentSummary: { type: String, default: null }
 }, { timestamps: true });
 
 module.exports = mongoose.model('Hotel', hotelSchema);

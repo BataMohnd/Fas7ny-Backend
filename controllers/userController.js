@@ -146,3 +146,67 @@ exports.resetPassword = async (req, res) => {
         res.status(500).json({ status: 'fail', message: err.message });
     }
 };
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FEATURE 3: Saved Places (MongoDB mirror of Firestore favorites)
+// Used by the proactive suggestion algorithm server-side.
+// Flutter uses Firestore as the real-time source; these endpoints sync to MongoDB.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// POST /api/users/:userId/saved  — add a place to savedPlaces
+exports.addSavedPlace = async (req, res) => {
+    try {
+        const { userId } = req.params;
+        const { placeId } = req.body;
+
+        if (!placeId) return res.status(400).json({ status: 'fail', message: 'placeId is required' });
+
+        // $addToSet prevents duplicates atomically
+        const user = await User.findOneAndUpdate(
+            { uid: userId },
+            { $addToSet: { savedPlaces: placeId } },
+            { new: true, upsert: false }
+        );
+
+        if (!user) return res.status(404).json({ status: 'fail', message: 'User not found' });
+
+        console.log(`[Favorites] Added ${placeId} to ${userId}'s savedPlaces (${user.savedPlaces.length} total)`);
+        res.status(200).json({ status: 'success', savedPlaces: user.savedPlaces });
+    } catch (err) {
+        res.status(400).json({ status: 'fail', message: err.message });
+    }
+};
+
+// DELETE /api/users/:userId/saved/:placeId  — remove a place
+exports.removeSavedPlace = async (req, res) => {
+    try {
+        const { userId, placeId } = req.params;
+
+        const user = await User.findOneAndUpdate(
+            { uid: userId },
+            { $pull: { savedPlaces: placeId } },
+            { new: true }
+        );
+
+        if (!user) return res.status(404).json({ status: 'fail', message: 'User not found' });
+
+        console.log(`[Favorites] Removed ${placeId} from ${userId}'s savedPlaces`);
+        res.status(200).json({ status: 'success', savedPlaces: user.savedPlaces });
+    } catch (err) {
+        res.status(400).json({ status: 'fail', message: err.message });
+    }
+};
+
+// GET /api/users/:userId/saved  — fetch the full saved list
+exports.getSavedPlaces = async (req, res) => {
+    try {
+        const { userId } = req.params;
+        const user = await User.findOne({ uid: userId }).select('savedPlaces');
+
+        if (!user) return res.status(404).json({ status: 'fail', message: 'User not found' });
+
+        res.status(200).json({ status: 'success', savedPlaces: user.savedPlaces || [] });
+    } catch (err) {
+        res.status(400).json({ status: 'fail', message: err.message });
+    }
+};

@@ -15,10 +15,16 @@ const placeSchema = new mongoose.Schema({
     location: {
         type: { type: String, enum: ['Point'], default: 'Point' },
         coordinates: { type: [Number] } // [longitude, latitude]
-    }
+    },
+    sentimentSummary: { type: String, default: null },
+    city: { type: String, default: "" } // Added for city-based filtering
 });
 
 // Create the Geospatial Index for the Nearest Neighbor search
 placeSchema.index({ location: '2dsphere' });
 
-module.exports = mongoose.model('Place', placeSchema);
+// Architecture Advice: Indexes for efficient searching and sorting by budget
+placeSchema.index({ city: 1, price: 1 });
+placeSchema.index({ city: 1, category: 1, price: 1 });
+
+module.exports = mongoose.model('Place', placeSchema);

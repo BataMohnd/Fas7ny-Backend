@@ -1,49 +1,78 @@
 const admin = require('../firebaseConfig');
-const { GoogleGenerativeAI } = require('@google/generative-ai');
-
-// Initialize Gemini
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || 'YOUR_GEMINI_KEY');
-const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" }, { apiVersion: 'v1' });
+const { callGemini } = require('./geminiClient');
+const Notification = require('../models/Notification');
 
 /**
- * Sends a push notification to a specific user.
+ * Sends a push notification to a specific user and saves it to the database history.
  * Includes Gemini for personalized travel tips if destination is provided.
+ * 🟢 Demo Safe: Does not throw errors if Firebase is misconfigured.
  */
-exports.sendPushNotification = async (userId, title, body, destination = null) => {
+exports.sendPushNotification = async (userId, title, body, destination = null, type = 'system', extraData = {}) => {
     try {
-        let finalBody = body;
+        let personalizedBody = body;
 
         // 1. Personalized Gemini Touch (Optional)
         if (destination) {
             try {
-                const prompt = `Generate a short, enthusiastic travel notification body (max 20 words) for a user going to ${destination}. Mention a local vibe or a quick tip. Keep it friendly.`;
-                const result = await model.generateContent({ contents: [{ role: 'user', parts: [{ text: prompt }] }] });
-                const response = await result.response;
-                finalBody = response.text().trim() || body;
-            } catch (geminiError) {
-                console.warn("⚠️ Gemini failed, using default body: ", geminiError.message);
+                const prompt = `Rewrite this notification to be more engaging and personalized for a user interested in travel to ${destination}. Original body: "${body}". Max 15 words. Arabic language.`;
+                console.log("📡 [Fas7ny AI] Calling Direct REST API for Personalized Notification");
+                const aiResult = await callGemini(prompt);
+                
+                if (aiResult.ok) {
+                    personalizedBody = aiResult.text.trim();
+                } else {
+                    console.log(`📡 [Notifications] Using original body due to model return error.`);
+                }
+            } catch (aiErr) {
+                console.log("📡 [Notifications] AI personalization skipped:", aiErr.message);
             }
+        }
+
+        // 2. Persist to Database Notification History (Ensures it appears in the app regardless of FCM)
+        try {
+            await Notification.create({
+                userId,
+                title,
+                body: personalizedBody,
+                type,
+                data: extraData
+            });
+            console.log(`💾 Notification saved to DB for user_${userId}`);
+        } catch (dbErr) {
+            console.error("❌ Failed to save notification to DB:", dbErr.message);
+        }
+
+        // 3. Check if admin is initialized properly (demo safety check)
+        if (!admin || !admin.app || admin.app.length === 0) {
+            console.warn("⚠️ [Fas7ny FCM] Firebase Admin not initialized. Skipping push notification.");
+            return { success: false, reason: "Firebase Admin not initialized" };
         }
 
         const message = {
             notification: {
                 title: title,
-                body: finalBody,
+                body: personalizedBody,
             },
             data: {
                 click_action: 'FLUTTER_NOTIFICATION_CLICK',
                 userId: userId,
+                type: type,
                 timestamp: new Date().toISOString()
             },
-            topic: `user_${userId}` // We use topics for simplicity if token is not saved
+            topic: `user_${userId}` 
         };
 
-        // 2. Send via Firebase Admin
-        const response = await admin.messaging().send(message);
-        console.log(`✅ Push Notification sent to user_${userId}: `, response);
-        return response;
+        // 4. Send via Firebase Admin
+        try {
+            const response = await admin.messaging().send(message);
+            console.log(`✅ Push Notification sent to user_${userId}: `, response);
+            return { success: true, response };
+        } catch (fcmError) {
+            console.warn("⚠️ [Fas7ny FCM] Push Notification failed (possibly missing credentials):", fcmError.message);
+            return { success: false, reason: fcmError.message };
+        }
     } catch (error) {
-        console.error("❌ FCM Error: ", error.message);
-        throw error;
+        console.error("❌ Notification Controller Error: ", error.message);
+        return { success: false, reason: error.message };
     }
 };

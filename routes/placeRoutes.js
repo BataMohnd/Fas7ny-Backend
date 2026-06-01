@@ -5,9 +5,12 @@ const placeController = require('../controllers/placeController');
 router.get('/search', placeController.searchPlaces);
 router.get('/all', placeController.getAllPlaces);
 router.get('/hotels', placeController.getHotels);
+router.get('/hotels/city', placeController.getHotelsByCity);
 router.get('/hotels/:hotelId', placeController.getHotelDetails);
 router.get('/attractions/availability', placeController.getAttractionAvailability);
 router.post('/calculate-price', placeController.calculateBookingPrice);
-router.get('/nearby', placeController.getNearbyAttractions);
+router.get('/nearby', placeController.getNearbyPlaces);
+router.get('/nearby-places', placeController.getNearbyPlaces); // Alias for discovery
+router.get('/nearby-hotels', placeController.getNearbyHotels);
 
 module.exports = router;
